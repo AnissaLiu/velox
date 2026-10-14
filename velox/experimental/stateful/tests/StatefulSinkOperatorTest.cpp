@@ -23,6 +23,7 @@
 
 #include "velox/common/base/tests/GTestUtils.h"
 #include "velox/connectors/Connector.h"
+#include "velox/core/Expressions.h"
 #include "velox/core/PlanFragment.h"
 #include "velox/core/PlanNode.h"
 #include "velox/exec/Driver.h"
@@ -77,12 +78,15 @@ class SpyOperator : public exec::Operator {
   RowVectorPtr captured_;
 };
 
-// A ConnectorInsertTableHandle that declares supportsRowKind, standing in for
-// changelog-aware sinks such as print.
+// A ConnectorInsertTableHandle with configurable supportsRowKind, standing in
+// for changelog-aware sinks such as print.
 class CaptureInsertTableHandle : public connector::ConnectorInsertTableHandle {
  public:
+  explicit CaptureInsertTableHandle(bool supportsRowKind)
+      : supportsRowKind_(supportsRowKind) {}
+
   bool supportsRowKind() const override {
-    return true;
+    return supportsRowKind_;
   }
 
   std::string toString() const override {
@@ -92,6 +96,9 @@ class CaptureInsertTableHandle : public connector::ConnectorInsertTableHandle {
   folly::dynamic serialize() const override {
     return folly::dynamic::object;
   }
+
+ private:
+  const bool supportsRowKind_;
 };
 
 // Records every RowVector appended, so tests can assert what the real
@@ -226,6 +233,12 @@ TEST_F(
       rowKindCol->valueAt(1), static_cast<int8_t>(RowKind::UPDATE_BEFORE));
   EXPECT_EQ(rowKindCol->valueAt(2), static_cast<int8_t>(RowKind::UPDATE_AFTER));
   EXPECT_EQ(rowKindCol->valueAt(3), static_cast<int8_t>(RowKind::DELETE));
+  auto values = captured->childAt(0)->asFlatVector<int64_t>();
+  ASSERT_NE(values, nullptr);
+  EXPECT_EQ(values->valueAt(0), 10);
+  EXPECT_EQ(values->valueAt(1), 20);
+  EXPECT_EQ(values->valueAt(2), 30);
+  EXPECT_EQ(values->valueAt(3), 40);
 }
 
 // supportsRowKind=false: the record value is fed as-is; the trailing $row_kind
@@ -245,6 +258,12 @@ TEST_F(
   // Only the user column; no trailing $row_kind.
   EXPECT_EQ(captured->type()->size(), 1);
   EXPECT_EQ(asRowType(captured->type())->nameOf(0), "c");
+  auto values = captured->childAt(0)->asFlatVector<int64_t>();
+  ASSERT_NE(values, nullptr);
+  EXPECT_EQ(values->valueAt(0), 10);
+  EXPECT_EQ(values->valueAt(1), 20);
+  EXPECT_EQ(values->valueAt(2), 30);
+  EXPECT_EQ(values->valueAt(3), 40);
 }
 
 // supportsRowKind=true on an appendOnly record (no rowKind): toMergedRowVector
@@ -268,6 +287,11 @@ TEST_F(StatefulSinkOperatorTest, addInputAppendsConstantInsertForAppendOnly) {
   EXPECT_EQ(rowKindCol->valueAt(0), static_cast<int8_t>(RowKind::INSERT));
   EXPECT_EQ(rowKindCol->valueAt(1), static_cast<int8_t>(RowKind::INSERT));
   EXPECT_EQ(rowKindCol->valueAt(2), static_cast<int8_t>(RowKind::INSERT));
+  auto values = captured->childAt(0)->asFlatVector<int64_t>();
+  ASSERT_NE(values, nullptr);
+  EXPECT_EQ(values->valueAt(0), 1);
+  EXPECT_EQ(values->valueAt(1), 2);
+  EXPECT_EQ(values->valueAt(2), 3);
 }
 
 // Real-path: StatefulPlanner::plan over a real TableWriteNode whose
@@ -282,9 +306,11 @@ TEST_F(StatefulSinkOperatorTest, realPlannerPathThreadsRowKindIntoDataSink) {
   auto sinkInputs = std::make_shared<std::vector<RowVectorPtr>>();
   connector::registerConnector(
       std::make_shared<CaptureConnector>(connectorId, sinkInputs));
+  auto unregister = folly::makeGuard(
+      [&connectorId] { connector::unregisterConnector(connectorId); });
 
   auto insertHandle = std::make_shared<core::InsertTableHandle>(
-      connectorId, std::make_shared<CaptureInsertTableHandle>());
+      connectorId, std::make_shared<CaptureInsertTableHandle>(true));
   auto source = std::make_shared<core::ValuesNode>(
       core::PlanNodeId{"vals"},
       std::vector<RowVectorPtr>{
@@ -308,8 +334,6 @@ TEST_F(StatefulSinkOperatorTest, realPlannerPathThreadsRowKindIntoDataSink) {
   chain->initialize();
   chain->addInput(StreamRecord::create("sink", mergedBatch()));
   chain->finish();
-
-  connector::unregisterConnector(connectorId);
 
   ASSERT_EQ(sinkInputs->size(), 1);
   const auto& received = sinkInputs->at(0);
@@ -346,7 +370,7 @@ TEST_F(
       [&connectorId] { connector::unregisterConnector(connectorId); });
 
   auto insertHandle = std::make_shared<core::InsertTableHandle>(
-      connectorId, std::make_shared<CaptureInsertTableHandle>());
+      connectorId, std::make_shared<CaptureInsertTableHandle>(true));
   auto source = std::make_shared<core::ValuesNode>(
       core::PlanNodeId{"vals"},
       std::vector<RowVectorPtr>{
@@ -381,6 +405,149 @@ TEST_F(
   const auto& received = sinkInputs->at(0);
   ASSERT_EQ(received->type()->size(), 2);
   EXPECT_EQ(asRowType(received->type())->nameOf(0), "user_c");
+  EXPECT_EQ(asRowType(received->type())->nameOf(1), "$row_kind");
+  auto values = received->childAt(0)->asFlatVector<int64_t>();
+  ASSERT_NE(values, nullptr);
+  EXPECT_EQ(values->valueAt(0), 10);
+  EXPECT_EQ(values->valueAt(1), 20);
+  EXPECT_EQ(values->valueAt(2), 30);
+  EXPECT_EQ(values->valueAt(3), 40);
+  auto kinds = received->childAt(1)->asFlatVector<int8_t>();
+  ASSERT_NE(kinds, nullptr);
+  EXPECT_EQ(kinds->valueAt(0), static_cast<int8_t>(RowKind::INSERT));
+  EXPECT_EQ(kinds->valueAt(1), static_cast<int8_t>(RowKind::UPDATE_BEFORE));
+  EXPECT_EQ(kinds->valueAt(2), static_cast<int8_t>(RowKind::UPDATE_AFTER));
+  EXPECT_EQ(kinds->valueAt(3), static_cast<int8_t>(RowKind::DELETE));
+}
+
+// supportsRowKind=false planner path: the TableWriteNode is left unaugmented
+// and the sink receives the original columns only. The planner reads the flag
+// in two places (transformOperator for schema augmentation and
+// transformGenericOperator for the merge); this pins both to the false branch.
+TEST_F(StatefulSinkOperatorTest, plannerSkipsRowKindWhenNotSupported) {
+  const std::string connectorId = "stateful-sink-capture-plain";
+  auto sinkInputs = std::make_shared<std::vector<RowVectorPtr>>();
+  connector::registerConnector(
+      std::make_shared<CaptureConnector>(connectorId, sinkInputs));
+  auto unregister = folly::makeGuard(
+      [&connectorId] { connector::unregisterConnector(connectorId); });
+
+  auto insertHandle = std::make_shared<core::InsertTableHandle>(
+      connectorId, std::make_shared<CaptureInsertTableHandle>(false));
+  auto source = std::make_shared<core::ValuesNode>(
+      core::PlanNodeId{"vals"},
+      std::vector<RowVectorPtr>{
+          makeRowVector({"c"}, {makeFlatVector<int64_t>({1})})});
+  auto tableWrite = std::make_shared<core::TableWriteNode>(
+      core::PlanNodeId{"write"},
+      ROW({"c"}, {BIGINT()}),
+      std::vector<std::string>{"c"},
+      nullptr /* aggregationNode */,
+      insertHandle,
+      false /* hasPartitioningScheme */,
+      exec::TableWriteTraits::outputType(nullptr),
+      connector::CommitStrategy::kNoCommit,
+      source);
+
+  core::PlanFragment planFragment;
+  planFragment.planNode = std::make_shared<StatefulPlanNode>(
+      tableWrite, std::vector<core::PlanNodePtr>{});
+  auto chain = StatefulPlanner::plan(planFragment, driverCtx_.get(), nullptr);
+
+  chain->initialize();
+  // Even though the record carries per-row kinds, they are dropped on this
+  // path and the schema stays N columns.
+  chain->addInput(StreamRecord::create("sink", mergedBatch()));
+  chain->finish();
+
+  ASSERT_EQ(sinkInputs->size(), 1);
+  const auto& received = sinkInputs->at(0);
+  ASSERT_EQ(received->type()->size(), 1);
+  EXPECT_EQ(asRowType(received->type())->nameOf(0), "c");
+  auto values = received->childAt(0)->asFlatVector<int64_t>();
+  ASSERT_NE(values, nullptr);
+  EXPECT_EQ(values->valueAt(0), 10);
+  EXPECT_EQ(values->valueAt(1), 20);
+  EXPECT_EQ(values->valueAt(2), 30);
+  EXPECT_EQ(values->valueAt(3), 40);
+}
+
+// Aggregation path: a TableWriteNode carrying a real AggregationNode (global
+// sum) with a row-kind-aware sink. The merged N+1 column input reaches the
+// connector DataSink while the embedded HashAggregation keeps reading its
+// channels from the original N-column plan: appending the trailing $row_kind
+// column must not shift channel-based addressing.
+TEST_F(StatefulSinkOperatorTest, plannerAggregationPathWithRowKind) {
+  const std::string connectorId = "stateful-sink-capture-agg";
+  auto sinkInputs = std::make_shared<std::vector<RowVectorPtr>>();
+  connector::registerConnector(
+      std::make_shared<CaptureConnector>(connectorId, sinkInputs));
+  auto unregister = folly::makeGuard(
+      [&connectorId] { connector::unregisterConnector(connectorId); });
+
+  auto insertHandle = std::make_shared<core::InsertTableHandle>(
+      connectorId, std::make_shared<CaptureInsertTableHandle>(true));
+  auto source = std::make_shared<core::ValuesNode>(
+      core::PlanNodeId{"vals"},
+      std::vector<RowVectorPtr>{
+          makeRowVector({"c"}, {makeFlatVector<int64_t>({1})})});
+
+  // Global sum over "c"; the aggregation's declared input stays the original
+  // N-column source (the planner passes aggregationNode through unchanged).
+  core::AggregationNode::Aggregate sumAgg;
+  sumAgg.call = std::make_shared<core::CallTypedExpr>(
+      BIGINT(),
+      std::vector<core::TypedExprPtr>{
+          std::make_shared<core::FieldAccessTypedExpr>(BIGINT(), "c")},
+      "sum");
+  sumAgg.rawInputTypes = {BIGINT()};
+  auto aggregation = std::make_shared<core::AggregationNode>(
+      core::PlanNodeId{"agg"},
+      core::AggregationNode::Step::kSingle,
+      std::vector<core::FieldAccessTypedExprPtr>{} /* groupingKeys */,
+      std::vector<core::FieldAccessTypedExprPtr>{} /* preGroupedKeys */,
+      std::vector<std::string>{"c_sum"},
+      std::vector<core::AggregationNode::Aggregate>{sumAgg},
+      false /* ignoreNullKeys */,
+      source);
+
+  auto tableWrite = std::make_shared<core::TableWriteNode>(
+      core::PlanNodeId{"write"},
+      ROW({"c"}, {BIGINT()}),
+      std::vector<std::string>{"c"},
+      aggregation,
+      insertHandle,
+      false /* hasPartitioningScheme */,
+      exec::TableWriteTraits::outputType(aggregation),
+      connector::CommitStrategy::kNoCommit,
+      source);
+
+  core::PlanFragment planFragment;
+  planFragment.planNode = std::make_shared<StatefulPlanNode>(
+      tableWrite, std::vector<core::PlanNodePtr>{});
+  auto chain = StatefulPlanner::plan(planFragment, driverCtx_.get(), nullptr);
+
+  chain->initialize();
+  chain->addInput(StreamRecord::create("sink", mergedBatch()));
+
+  // finish() discards sink-operator output, so drain the wrapped TableWriter
+  // directly to read the aggregation stats row.
+  auto& writer = chain->op();
+  writer->noMoreInput();
+  auto stats = writer->getOutput();
+  ASSERT_NE(stats, nullptr);
+  ASSERT_EQ(stats->size(), 1);
+  ASSERT_EQ(stats->type()->size(), 4);
+  EXPECT_EQ(asRowType(stats->type())->nameOf(3), "c_sum");
+  auto sums = stats->childAt(3)->asFlatVector<int64_t>();
+  ASSERT_NE(sums, nullptr);
+  EXPECT_EQ(sums->valueAt(0), 100); // 10 + 20 + 30 + 40
+
+  // The connector side still receives user column plus trailing $row_kind.
+  ASSERT_EQ(sinkInputs->size(), 1);
+  const auto& received = sinkInputs->at(0);
+  ASSERT_EQ(received->type()->size(), 2);
+  EXPECT_EQ(asRowType(received->type())->nameOf(0), "c");
   EXPECT_EQ(asRowType(received->type())->nameOf(1), "$row_kind");
   auto values = received->childAt(0)->asFlatVector<int64_t>();
   ASSERT_NE(values, nullptr);
