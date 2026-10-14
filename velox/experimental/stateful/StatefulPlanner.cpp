@@ -90,6 +90,13 @@ std::shared_ptr<const core::TableWriteNode> augmentTableWriteForRowKind(
   types.emplace_back(TINYINT());
   auto augmentedColumns = ROW(std::move(names), std::move(types));
 
+  // columnNames() are the names written through to the connector
+  // (TableWriter builds the sink input type from them) and may differ from
+  // the source column names, so preserve them and only append $row_kind
+  // instead of reusing the augmented source-column names.
+  auto writeNames = node->columnNames();
+  writeNames.emplace_back(std::string(kRowKindColumnName));
+
   // The source schema must resolve every column name; the TableWriteNode
   // constructor enforces name containment. Wrap the original source in
   // SchemaWithRowKindNode, a schema-declaration-only wrapper whose output
@@ -101,7 +108,7 @@ std::shared_ptr<const core::TableWriteNode> augmentTableWriteForRowKind(
   return std::make_shared<core::TableWriteNode>(
       node->id(),
       augmentedColumns,
-      augmentedColumns->names(),
+      std::move(writeNames),
       node->aggregationNode(),
       node->insertTableHandle(),
       node->hasPartitioningScheme(),

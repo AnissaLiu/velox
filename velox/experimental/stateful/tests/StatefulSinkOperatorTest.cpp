@@ -16,6 +16,7 @@
 
 #include "velox/experimental/stateful/StatefulSinkOperator.h"
 
+#include <folly/ScopeGuard.h>
 #include <folly/dynamic.h>
 #include <folly/init/Init.h>
 #include <gtest/gtest.h>
@@ -315,6 +316,71 @@ TEST_F(StatefulSinkOperatorTest, realPlannerPathThreadsRowKindIntoDataSink) {
   // User column plus trailing $row_kind, in TableWriter's mapped order.
   ASSERT_EQ(received->type()->size(), 2);
   EXPECT_EQ(asRowType(received->type())->nameOf(0), "c");
+  EXPECT_EQ(asRowType(received->type())->nameOf(1), "$row_kind");
+  auto values = received->childAt(0)->asFlatVector<int64_t>();
+  ASSERT_NE(values, nullptr);
+  EXPECT_EQ(values->valueAt(0), 10);
+  EXPECT_EQ(values->valueAt(1), 20);
+  EXPECT_EQ(values->valueAt(2), 30);
+  EXPECT_EQ(values->valueAt(3), 40);
+  auto kinds = received->childAt(1)->asFlatVector<int8_t>();
+  ASSERT_NE(kinds, nullptr);
+  EXPECT_EQ(kinds->valueAt(0), static_cast<int8_t>(RowKind::INSERT));
+  EXPECT_EQ(kinds->valueAt(1), static_cast<int8_t>(RowKind::UPDATE_BEFORE));
+  EXPECT_EQ(kinds->valueAt(2), static_cast<int8_t>(RowKind::UPDATE_AFTER));
+  EXPECT_EQ(kinds->valueAt(3), static_cast<int8_t>(RowKind::DELETE));
+}
+
+// columnNames() (the names written through to the connector) may differ from
+// columns()->names() (the upstream source names). Augmentation must preserve
+// the write names and only append $row_kind, so the sink receives user_c +
+// $row_kind rather than the source column name _c0.
+TEST_F(
+    StatefulSinkOperatorTest,
+    plannerPreservesWriteColumnNamesWhenAugmenting) {
+  const std::string connectorId = "stateful-sink-capture-names";
+  auto sinkInputs = std::make_shared<std::vector<RowVectorPtr>>();
+  connector::registerConnector(
+      std::make_shared<CaptureConnector>(connectorId, sinkInputs));
+  auto unregister = folly::makeGuard(
+      [&connectorId] { connector::unregisterConnector(connectorId); });
+
+  auto insertHandle = std::make_shared<core::InsertTableHandle>(
+      connectorId, std::make_shared<CaptureInsertTableHandle>());
+  auto source = std::make_shared<core::ValuesNode>(
+      core::PlanNodeId{"vals"},
+      std::vector<RowVectorPtr>{
+          makeRowVector({"_c0"}, {makeFlatVector<int64_t>({10})})});
+  // Source column _c0 is written to the sink under the name user_c.
+  auto tableWrite = std::make_shared<core::TableWriteNode>(
+      core::PlanNodeId{"write"},
+      ROW({"_c0"}, {BIGINT()}),
+      std::vector<std::string>{"user_c"},
+      nullptr /* aggregationNode */,
+      insertHandle,
+      false /* hasPartitioningScheme */,
+      exec::TableWriteTraits::outputType(nullptr),
+      connector::CommitStrategy::kNoCommit,
+      source);
+
+  core::PlanFragment planFragment;
+  planFragment.planNode = std::make_shared<StatefulPlanNode>(
+      tableWrite, std::vector<core::PlanNodePtr>{});
+  auto chain = StatefulPlanner::plan(planFragment, driverCtx_.get(), nullptr);
+
+  chain->initialize();
+  chain->addInput(StreamRecord::create(
+      "sink",
+      makeRowVector(
+          {"_c0", "$row_kind"},
+          {makeFlatVector<int64_t>({10, 20, 30, 40}),
+           makeFlatVector<int8_t>({0, 1, 2, 3})})));
+  chain->finish();
+
+  ASSERT_EQ(sinkInputs->size(), 1);
+  const auto& received = sinkInputs->at(0);
+  ASSERT_EQ(received->type()->size(), 2);
+  EXPECT_EQ(asRowType(received->type())->nameOf(0), "user_c");
   EXPECT_EQ(asRowType(received->type())->nameOf(1), "$row_kind");
   auto values = received->childAt(0)->asFlatVector<int64_t>();
   ASSERT_NE(values, nullptr);
