@@ -57,7 +57,9 @@ class PrintSink : public DataSink {
   // trailing $row_kind TINYINT column so per-row RowKind flows into this sink;
   // $row_kind drives the +I/-U/+U/-D prefix and is not rendered as a field.
   const RowTypePtr dataColumnsType_;
-  const std::vector<FormatterPtr> fieldFormatters_;
+  // Renders whole data-column rows (brackets, separators, nulls); the per-row
+  // +I/-U/+U/-D prefix is threaded through its toString tail parameter.
+  const FormatterPtr rowFormatter_;
   const bool hasRowKind_;
   const ConnectorQueryCtx* queryCtx_;
   const std::string prefix_;

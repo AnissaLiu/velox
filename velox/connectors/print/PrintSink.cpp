@@ -87,15 +87,9 @@ PrintSink::PrintSink(
         }
         return inputType;
       }()),
-      fieldFormatters_([&] {
-        std::vector<FormatterPtr> formatters;
+      rowFormatter_([&] {
         auto tz = tz::locateZone(queryCtx->sessionTimezone());
-        formatters.reserve(dataColumnsType_->size());
-        for (auto i = 0; i < dataColumnsType_->size(); ++i) {
-          formatters.emplace_back(
-              createFormatter(dataColumnsType_->childAt(i), tz));
-        }
-        return formatters;
+        return createFormatter(dataColumnsType_, tz);
       }()),
       hasRowKind_(dataColumnsType_->size() != inputType_->size()),
       queryCtx_(queryCtx),
@@ -129,11 +123,10 @@ std::string PrintSink::computePrefix(
 }
 
 void PrintSink::appendData(RowVectorPtr input) {
-  const auto fieldCount = dataColumnsType_->size();
   VELOX_CHECK_EQ(input->childrenSize(), inputType_->size());
-  VELOX_CHECK_EQ(fieldFormatters_.size(), fieldCount);
 
   std::shared_ptr<SimpleVector<int8_t>> rowKindVec;
+  RowVectorPtr dataInput = input;
   if (hasRowKind_) {
     auto rowKindIdx = inputType_->size() - 1;
     rowKindVec = std::dynamic_pointer_cast<SimpleVector<int8_t>>(
@@ -146,6 +139,17 @@ void PrintSink::appendData(RowVectorPtr input) {
         !rowKindVec->mayHaveNulls(),
         "{} column must not contain nulls",
         kRowKindColumnName);
+    // Strip the trailing $row_kind column so the row formatter renders the
+    // data columns only; children and the row nulls bitmap are shared,
+    // nothing is copied.
+    std::vector<VectorPtr> children = input->children();
+    children.pop_back();
+    dataInput = std::make_shared<RowVector>(
+        queryCtx_->memoryPool(),
+        dataColumnsType_,
+        input->nulls(),
+        input->size(),
+        std::move(children));
   }
 
   std::ostream& stream = isStdErr_ ? static_cast<std::ostream&>(std::cerr)
@@ -155,20 +159,7 @@ void PrintSink::appendData(RowVectorPtr input) {
     const char* rowPrefix =
         hasRowKind_ ? rowKindPrefix(rowKindVec->valueAt(i)) : "+I";
     std::stringstream ss;
-    ss << rowPrefix << "[";
-    for (auto j = 0; j < fieldCount; ++j) {
-      const auto& field = input->childAt(j);
-      if (field->isNullAt(i)) {
-        ss << "null";
-      } else {
-        fieldFormatters_[j]->toString(
-            field, dataColumnsType_->childAt(j), i, ss);
-      }
-      if (j != fieldCount - 1) {
-        ss << ", ";
-      }
-    }
-    ss << "]";
+    rowFormatter_->toString(dataInput, dataColumnsType_, i, ss, rowPrefix);
     stream << prefix_ << ss.str() << std::endl;
   }
 }

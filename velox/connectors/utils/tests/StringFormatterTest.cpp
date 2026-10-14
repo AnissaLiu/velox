@@ -16,6 +16,7 @@
 #include "velox/connectors/utils/tests/StringFormatterTest.h"
 #include "velox/connectors/utils/StringFormatter.h"
 #include "velox/type/Type.h"
+#include "velox/vector/FlatVector.h"
 
 #include <folly/init/Init.h>
 #include <gtest/gtest.h>
@@ -74,6 +75,48 @@ TEST_F(StringFormatterTest, testSplit) {
   ASSERT_TRUE(ss3[1] == "[+I[1,2],+I[3,4]]");
   std::vector<std::string> ss4 = StringFormatter::split(s4, ",");
   ASSERT_TRUE(ss4.size() == 2);
+}
+
+TEST_F(StringFormatterTest, testRowFormatterToString) {
+  // Top-level row: BIGINT a, ROW(BIGINT x, BIGINT y) b, BIGINT c.
+  auto nestedType = ROW({{"x", BIGINT()}, {"y", BIGINT()}});
+  auto rowType = ROW({{"a", BIGINT()}, {"b", nestedType}, {"c", BIGINT()}});
+  auto formatter = createFormatter(rowType, tz::locateZone("UTC"));
+
+  auto xVec =
+      BaseVector::create<FlatVector<int64_t>>(BIGINT(), 1, memoryPool.get());
+  auto yVec =
+      BaseVector::create<FlatVector<int64_t>>(BIGINT(), 1, memoryPool.get());
+  xVec->set(0, 1);
+  yVec->set(0, 2);
+  auto nested = std::make_shared<RowVector>(
+      memoryPool.get(),
+      nestedType,
+      /*nulls=*/nullptr,
+      1,
+      std::vector<VectorPtr>{xVec, yVec});
+  auto aVec =
+      BaseVector::create<FlatVector<int64_t>>(BIGINT(), 1, memoryPool.get());
+  aVec->set(0, 99);
+  auto cVec =
+      BaseVector::create<FlatVector<int64_t>>(BIGINT(), 1, memoryPool.get());
+  cVec->setNull(0, true);
+  auto row = std::make_shared<RowVector>(
+      memoryPool.get(),
+      rowType,
+      /*nulls=*/nullptr,
+      1,
+      std::vector<VectorPtr>{aVec, nested, cVec});
+
+  std::stringstream ssDefault;
+  formatter->toString(row, rowType, 0, ssDefault);
+  ASSERT_TRUE(ssDefault.str() == "+I[99, +I[1, 2], null]");
+
+  // An explicit top-level prefix is rendered before the opening bracket while
+  // the nested row keeps the +I default.
+  std::stringstream ssPrefix;
+  formatter->toString(row, rowType, 0, ssPrefix, "-U");
+  ASSERT_TRUE(ssPrefix.str() == "-U[99, +I[1, 2], null]");
 }
 
 TEST_F(StringFormatterTest, testStringToTimestamp) {

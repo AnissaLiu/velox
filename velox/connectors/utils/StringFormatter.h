@@ -42,11 +42,17 @@ struct StringFormatter {
   }
   StringFormatter() : timeZone_(tz::locateZone("UTC")) {}
 
+  /// Renders the value at `index` into `ss`. `rowKindPrefix` is the change-kind
+  /// prefix (+I/-U/+U/-D) rendered by RowFormatter before the opening bracket;
+  /// the other formatters ignore it. Nested rows always render the "+I"
+  /// default: Velox rows do not carry a nested change kind, matching Flink
+  /// where nested RowData defaults to INSERT.
   virtual const void toString(
       const VectorPtr& input,
       const TypePtr&,
       const size_t index,
-      std::stringstream& ss) = 0;
+      std::stringstream& ss,
+      const char* rowKindPrefix = "+I") = 0;
 
   virtual const void fromString(
       const std::string& s,
@@ -80,7 +86,8 @@ struct DefaultFormatter : public StringFormatter {
       const VectorPtr& input,
       const TypePtr& type,
       const size_t index,
-      std::stringstream& ss) override {
+      std::stringstream& ss,
+      const char* /*rowKindPrefix*/ = "+I") override {
     if (input->isNullAt(index)) {
       ss << "null";
     } else {
@@ -241,12 +248,13 @@ struct RowFormatter : public StringFormatter {
       const VectorPtr& input,
       const TypePtr& type,
       const size_t index,
-      std::stringstream& ss) override {
+      std::stringstream& ss,
+      const char* rowKindPrefix = "+I") override {
     auto rowInput = std::dynamic_pointer_cast<const RowVector>(input);
     auto rowType = std::dynamic_pointer_cast<const RowType>(type);
     VELOX_CHECK_EQ(rowInput->childrenSize(), rowType->children().size());
     VELOX_CHECK_EQ(rowInput->childrenSize(), formatters_.size());
-    ss << "+I[";
+    ss << rowKindPrefix << "[";
     for (size_t i = 0; i < rowInput->childrenSize(); ++i) {
       const VectorPtr& field = rowInput->childAt(i);
       const TypePtr& fieldType = rowType->childAt(i);
@@ -299,7 +307,8 @@ struct ArrayFormatter : public StringFormatter {
       const VectorPtr& input,
       const TypePtr& type,
       const size_t index,
-      std::stringstream& ss) override {
+      std::stringstream& ss,
+      const char* /*rowKindPrefix*/ = "+I") override {
     auto arrayInput = std::dynamic_pointer_cast<const ArrayVector>(input);
     auto arrayType = std::dynamic_pointer_cast<const ArrayType>(type);
     ss << "[";
@@ -360,7 +369,8 @@ struct MapFormatter : public StringFormatter {
       const VectorPtr& input,
       const TypePtr& type,
       const size_t index,
-      std::stringstream& ss) override {
+      std::stringstream& ss,
+      const char* /*rowKindPrefix*/ = "+I") override {
     auto mapInput = std::dynamic_pointer_cast<const MapVector>(input);
     auto mapType = std::dynamic_pointer_cast<const MapType>(type);
     ss << "{";

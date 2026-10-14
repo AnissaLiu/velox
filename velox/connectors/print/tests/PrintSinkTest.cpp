@@ -158,12 +158,7 @@ TEST_F(PrintSinkTest, AppendOnlyRowsRenderInsertPrefix) {
   sink.appendData(makeRow({1, 2, 3}, {10, 20, 30}));
   auto out = capture.stream.str();
 
-  EXPECT_NE(out.find("+I[1, 10]"), std::string::npos);
-  EXPECT_NE(out.find("+I[2, 20]"), std::string::npos);
-  EXPECT_NE(out.find("+I[3, 30]"), std::string::npos);
-  EXPECT_EQ(out.find("-U["), std::string::npos);
-  EXPECT_EQ(out.find("+U["), std::string::npos);
-  EXPECT_EQ(out.find("-D["), std::string::npos);
+  EXPECT_EQ(out, "id> +I[1, 10]\nid> +I[2, 20]\nid> +I[3, 30]\n");
 }
 
 // Trailing $row_kind column drives the per-row +I/-U/+U/-D prefix.
@@ -181,10 +176,8 @@ TEST_F(PrintSinkTest, RowKindColumnDrivesPrefix) {
       /*rowKinds=*/&kinds));
   auto out = capture.stream.str();
 
-  EXPECT_NE(out.find("+I[1, 10]"), std::string::npos);
-  EXPECT_NE(out.find("-U[2, 20]"), std::string::npos);
-  EXPECT_NE(out.find("+U[3, 30]"), std::string::npos);
-  EXPECT_NE(out.find("-D[4, 40]"), std::string::npos);
+  EXPECT_EQ(
+      out, "id> +I[1, 10]\nid> -U[2, 20]\nid> +U[3, 30]\nid> -D[4, 40]\n");
 }
 
 // print-identifier prefix is rendered before the row prefix.
@@ -206,7 +199,7 @@ TEST_F(PrintSinkTest, PrintIdentifierIsPrepended) {
   sink.appendData(row);
   auto out = capture.stream.str();
 
-  EXPECT_NE(out.find("table_q> +I[7]"), std::string::npos);
+  EXPECT_EQ(out, "table_q> +I[7]\n");
 }
 
 // With parallelism > 1, the task index suffix is rendered in the prefix.
@@ -221,7 +214,70 @@ TEST_F(PrintSinkTest, TaskIndexRenderedWhenParallel) {
   sink.appendData(makeRow({1}, {10}));
   auto out = capture.stream.str();
 
-  EXPECT_NE(out.find("id:2> +I[1, 10]"), std::string::npos);
+  EXPECT_EQ(out, "id:2> +I[1, 10]\n");
+}
+
+// Null data fields render as the null keyword in place.
+TEST_F(PrintSinkTest, NullDataFieldRendersNullKeyword) {
+  auto inputType = ROW({{"a", BIGINT()}, {"b", BIGINT()}});
+  auto queryCtx = makeQueryCtx();
+  PrintSink sink(inputType, "id", /*isStdErr=*/false, queryCtx.get());
+
+  ScopedStdoutCapture capture;
+  auto n = 2;
+  auto aVec = BaseVector::create<FlatVector<int64_t>>(BIGINT(), n, pool_.get());
+  auto bVec = BaseVector::create<FlatVector<int64_t>>(BIGINT(), n, pool_.get());
+  aVec->set(0, 1);
+  aVec->set(1, 2);
+  bVec->set(0, 10);
+  bVec->setNull(1, true);
+  auto row = std::make_shared<RowVector>(
+      pool_.get(),
+      inputType,
+      /*nulls=*/nullptr,
+      n,
+      std::vector<VectorPtr>{aVec, bVec});
+  sink.appendData(row);
+  auto out = capture.stream.str();
+
+  EXPECT_EQ(out, "id> +I[1, 10]\nid> +I[2, null]\n");
+}
+
+// A nested ROW field renders its own +I prefix regardless of the top-level
+// row kind, matching Flink where nested RowData always carries INSERT.
+TEST_F(PrintSinkTest, NestedRowFieldRendersOwnInsertPrefix) {
+  auto nestedType = ROW({{"x", BIGINT()}, {"y", BIGINT()}});
+  auto inputType =
+      ROW({{"a", BIGINT()}, {"b", nestedType}, {"$row_kind", TINYINT()}});
+  auto queryCtx = makeQueryCtx();
+  PrintSink sink(inputType, "id", /*isStdErr=*/false, queryCtx.get());
+
+  ScopedStdoutCapture capture;
+  auto xVec = BaseVector::create<FlatVector<int64_t>>(BIGINT(), 1, pool_.get());
+  auto yVec = BaseVector::create<FlatVector<int64_t>>(BIGINT(), 1, pool_.get());
+  xVec->set(0, 1);
+  yVec->set(0, 2);
+  auto nested = std::make_shared<RowVector>(
+      pool_.get(),
+      nestedType,
+      /*nulls=*/nullptr,
+      1,
+      std::vector<VectorPtr>{xVec, yVec});
+  auto aVec = BaseVector::create<FlatVector<int64_t>>(BIGINT(), 1, pool_.get());
+  aVec->set(0, 7);
+  auto kindVec =
+      BaseVector::create<FlatVector<int8_t>>(TINYINT(), 1, pool_.get());
+  kindVec->set(0, 1); // UPDATE_BEFORE
+  auto row = std::make_shared<RowVector>(
+      pool_.get(),
+      inputType,
+      /*nulls=*/nullptr,
+      1,
+      std::vector<VectorPtr>{aVec, nested, kindVec});
+  sink.appendData(row);
+  auto out = capture.stream.str();
+
+  EXPECT_EQ(out, "id> -U[7, +I[1, 2]]\n");
 }
 
 // A trailing $row_kind column whose type is not TINYINT fails loudly at sink
