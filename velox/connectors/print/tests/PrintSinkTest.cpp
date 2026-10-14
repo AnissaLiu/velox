@@ -23,6 +23,7 @@
 
 #include "velox/common/base/PrefixSortConfig.h"
 #include "velox/common/base/SpillConfig.h"
+#include "velox/common/base/tests/GTestUtils.h"
 #include "velox/common/config/Config.h"
 #include "velox/common/memory/Memory.h"
 #include "velox/connectors/Connector.h"
@@ -221,6 +222,45 @@ TEST_F(PrintSinkTest, TaskIndexRenderedWhenParallel) {
   auto out = capture.stream.str();
 
   EXPECT_NE(out.find("id:2> +I[1, 10]"), std::string::npos);
+}
+
+// A trailing $row_kind column whose type is not TINYINT fails loudly at sink
+// construction instead of mis-rendering rows later.
+TEST_F(PrintSinkTest, NonTinyIntRowKindColumnThrowsAtConstruction) {
+  auto inputType = ROW({{"a", BIGINT()}, {"$row_kind", BIGINT()}});
+  auto queryCtx = makeQueryCtx();
+  VELOX_ASSERT_THROW(
+      PrintSink(inputType, "id", /*isStdErr=*/false, queryCtx.get()),
+      "trailing $row_kind column must be TINYINT");
+}
+
+// Nulls in the $row_kind column are rejected at appendData time; every row
+// must carry a kind byte for the prefix to be derivable.
+TEST_F(PrintSinkTest, NullRowKindThrowsAtAppendData) {
+  auto inputType =
+      ROW({{"a", BIGINT()}, {"b", BIGINT()}, {"$row_kind", TINYINT()}});
+  auto queryCtx = makeQueryCtx();
+  PrintSink sink(inputType, "id", /*isStdErr=*/false, queryCtx.get());
+
+  auto n = 2;
+  auto aVec = BaseVector::create<FlatVector<int64_t>>(BIGINT(), n, pool_.get());
+  auto bVec = BaseVector::create<FlatVector<int64_t>>(BIGINT(), n, pool_.get());
+  aVec->set(0, 1);
+  bVec->set(0, 10);
+  aVec->set(1, 2);
+  bVec->set(1, 20);
+  auto kindVec =
+      BaseVector::create<FlatVector<int8_t>>(TINYINT(), n, pool_.get());
+  kindVec->set(0, 0);
+  kindVec->setNull(1, true);
+  auto row = std::make_shared<RowVector>(
+      pool_.get(),
+      inputType,
+      /*nulls=*/nullptr,
+      n,
+      std::vector<VectorPtr>{aVec, bVec, kindVec});
+
+  VELOX_ASSERT_THROW(sink.appendData(row), "must not contain nulls");
 }
 
 } // namespace facebook::velox::connector::print::test

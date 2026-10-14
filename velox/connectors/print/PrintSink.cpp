@@ -15,7 +15,6 @@
  */
 #include "velox/connectors/print/PrintSink.h"
 #include "velox/connectors/utils/StringFormatter.h"
-#include "velox/experimental/stateful/RowKind.h"
 #include "velox/type/tz/TimeZoneMap.h"
 #include "velox/vector/SimpleVector.h"
 
@@ -34,17 +33,22 @@ std::mutex& printSinkWriteMutex() {
   return m;
 }
 
+// Name of the optional trailing column carrying the per-row change kind. Byte
+// values match Flink's RowKind enum: 0=INSERT, 1=UPDATE_BEFORE,
+// 2=UPDATE_AFTER, 3=DELETE.
+constexpr std::string_view kRowKindColumnName = "$row_kind";
+
 // Matches Flink RowKind.shortString(): 0=INSERT -> "+I",
 // 1=UPDATE_BEFORE -> "-U", 2=UPDATE_AFTER -> "+U", 3=DELETE -> "-D".
 const char* rowKindPrefix(int8_t kind) {
-  switch (static_cast<stateful::RowKind>(kind)) {
-    case stateful::RowKind::INSERT:
+  switch (kind) {
+    case 0:
       return "+I";
-    case stateful::RowKind::UPDATE_BEFORE:
+    case 1:
       return "-U";
-    case stateful::RowKind::UPDATE_AFTER:
+    case 2:
       return "+U";
-    case stateful::RowKind::DELETE:
+    case 3:
       return "-D";
   }
   VELOX_FAIL("Unknown RowKind byte: {}", static_cast<int>(kind));
@@ -63,7 +67,13 @@ PrintSink::PrintSink(
         // reaches this sink).
         if (inputType->size() > 0 &&
             inputType->nameOf(inputType->size() - 1) ==
-                std::string(stateful::kRowKindColumnName)) {
+                std::string(kRowKindColumnName)) {
+          VELOX_CHECK_EQ(
+              inputType->childAt(inputType->size() - 1)->kind(),
+              TypeKind::TINYINT,
+              "trailing {} column must be TINYINT, got {}",
+              kRowKindColumnName,
+              inputType->childAt(inputType->size() - 1)->toString());
           std::vector<std::string> names;
           std::vector<TypePtr> types;
           auto n = inputType->size() - 1;
@@ -132,6 +142,10 @@ void PrintSink::appendData(RowVectorPtr input) {
         rowKindVec,
         "$row_kind column must be a SimpleVector<int8_t>, got encoding: {}",
         input->childAt(rowKindIdx)->encoding());
+    VELOX_CHECK(
+        !rowKindVec->mayHaveNulls(),
+        "{} column must not contain nulls",
+        kRowKindColumnName);
   }
 
   std::ostream& stream = isStdErr_ ? static_cast<std::ostream&>(std::cerr)
