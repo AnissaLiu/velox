@@ -13,15 +13,12 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include "velox/functions/flinksql/LogicalFunctions.h"
-
-#include "velox/functions/Registerer.h"
+#include "velox/functions/flinksql/registration/RegistrationFunctions.h"
 
 namespace facebook::velox::functions::flinksql {
 
 void registerLogicalFunctions(const std::string& /*prefix*/) {
-  // TODO: register the Flink logical expressions once implemented:
-  // registerFunction<Fn, Ret, Args>({prefix + "name"});
+  // TODO: add the Flink Logical expression registrations.
 }
 
 } // namespace facebook::velox::functions::flinksql

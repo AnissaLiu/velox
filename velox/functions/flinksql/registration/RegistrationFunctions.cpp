@@ -13,25 +13,18 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include "velox/functions/flinksql/Register.h"
-
-#include "velox/expression/VectorFunction.h"
-#include "velox/functions/flinksql/RegexFunctions.h"
-#include "velox/functions/lib/Re2Functions.h"
+#include "velox/functions/flinksql/registration/RegistrationFunctions.h"
 
 namespace facebook::velox::functions::flinksql {
 
 void registerFunctions(const std::string& prefix) {
-  exec::registerStatefulVectorFunction(
-      prefix + "regexp_extract", re2ExtractSignatures(), makeRegexExtract);
-
   registerArithmeticFunctions(prefix);
   registerConditionalFunctions(prefix);
-  registerDateTimeFunctions(prefix);
   registerHashFunctions(prefix);
   registerJsonFunctions(prefix);
   registerLogicalFunctions(prefix);
   registerStringFunctions(prefix);
+  registerTemporalFunctions(prefix);
 }
 
 } // namespace facebook::velox::functions::flinksql

@@ -13,13 +13,14 @@
 # limitations under the License.
 
 velox_add_library(
-  velox_functions_flink_registration
+  velox_functions_flink
   ArithmeticFunctionsRegistration.cpp
   ConditionalFunctionsRegistration.cpp
-  DateTimeFunctionsRegistration.cpp
   HashFunctionsRegistration.cpp
   JsonFunctionsRegistration.cpp
   LogicalFunctionsRegistration.cpp
-  StringFunctionsRegistration.cpp)
+  RegistrationFunctions.cpp
+  StringFunctionsRegistration.cpp
+  TemporalFunctionsRegistration.cpp)
 
-velox_link_libraries(velox_functions_flink_registration velox_functions_lib)
+velox_link_libraries(velox_functions_flink velox_functions_lib Folly::folly)

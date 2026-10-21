@@ -13,15 +13,12 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include "velox/functions/flinksql/ArithmeticFunctions.h"
-
-#include "velox/functions/Registerer.h"
+#include "velox/functions/flinksql/registration/RegistrationFunctions.h"
 
 namespace facebook::velox::functions::flinksql {
 
 void registerArithmeticFunctions(const std::string& /*prefix*/) {
-  // TODO: register the Flink arithmetic expressions once implemented:
-  // registerFunction<Fn, Ret, Args>({prefix + "name"});
+  // TODO: add the Flink Arithmetic expression registrations.
 }
 
 } // namespace facebook::velox::functions::flinksql

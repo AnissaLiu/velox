@@ -13,15 +13,12 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include "velox/functions/flinksql/HashFunctions.h"
-
-#include "velox/functions/Registerer.h"
+#include "velox/functions/flinksql/registration/RegistrationFunctions.h"
 
 namespace facebook::velox::functions::flinksql {
 
 void registerHashFunctions(const std::string& /*prefix*/) {
-  // TODO: register the Flink hash expressions once implemented:
-  // registerFunction<Fn, Ret, Args>({prefix + "name"});
+  // TODO: add the Flink Hash expression registrations.
 }
 
 } // namespace facebook::velox::functions::flinksql

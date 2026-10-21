@@ -14,29 +14,20 @@
  * limitations under the License.
  */
 #pragma once
-
 #include <string>
 
 namespace facebook::velox::functions::flinksql {
 
-// Register Flink SQL functions.
-//
-// Idempotent within a process when called with overwrite=true at the
-// exec::registerStatefulVectorFunction layer; existing registrations with the
-// same name are replaced.
-//
-// The per-family registration entry points below follow the prestosql
-// registration/ layout: each family owns one registration file under
-// registration/ and one implementation header beside this file; the families
-// are aggregated here.
+// Register Flink SQL functions. Idempotent within a process; existing
+// registrations with the same name are replaced.
 void registerFunctions(const std::string& prefix = "");
 
 void registerArithmeticFunctions(const std::string& prefix = "");
 void registerConditionalFunctions(const std::string& prefix = "");
-void registerDateTimeFunctions(const std::string& prefix = "");
 void registerHashFunctions(const std::string& prefix = "");
 void registerJsonFunctions(const std::string& prefix = "");
 void registerLogicalFunctions(const std::string& prefix = "");
 void registerStringFunctions(const std::string& prefix = "");
+void registerTemporalFunctions(const std::string& prefix = "");
 
 } // namespace facebook::velox::functions::flinksql
