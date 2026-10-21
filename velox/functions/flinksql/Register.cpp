@@ -24,6 +24,14 @@ namespace facebook::velox::functions::flinksql {
 void registerFunctions(const std::string& prefix) {
   exec::registerStatefulVectorFunction(
       prefix + "regexp_extract", re2ExtractSignatures(), makeRegexExtract);
+
+  registerArithmeticFunctions(prefix);
+  registerConditionalFunctions(prefix);
+  registerDateTimeFunctions(prefix);
+  registerHashFunctions(prefix);
+  registerJsonFunctions(prefix);
+  registerLogicalFunctions(prefix);
+  registerStringFunctions(prefix);
 }
 
 } // namespace facebook::velox::functions::flinksql
