@@ -52,8 +52,16 @@ class PrintSink : public DataSink {
 
  private:
   const RowTypePtr inputType_;
+  // dataColumnsType_ is inputType_ with an optional trailing $row_kind column
+  // stripped. The planner augments print-connector TableWriteNodes with a
+  // trailing $row_kind TINYINT column so per-row RowKind flows into this sink;
+  // $row_kind drives the +I/-U/+U/-D prefix and is not rendered as a field.
+  const RowTypePtr dataColumnsType_;
+  // Renders whole data-column rows (brackets, separators, nulls); the per-row
+  // +I/-U/+U/-D prefix is threaded through its toString tail parameter.
+  const FormatterPtr rowFormatter_;
+  const bool hasRowKind_;
   const ConnectorQueryCtx* queryCtx_;
-  const std::shared_ptr<StringFormatter> formatter_;
   const std::string prefix_;
   const bool isStdErr_;
   bool finished = false;

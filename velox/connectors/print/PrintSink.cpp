@@ -16,11 +16,13 @@
 #include "velox/connectors/print/PrintSink.h"
 #include "velox/connectors/utils/StringFormatter.h"
 #include "velox/type/tz/TimeZoneMap.h"
+#include "velox/vector/SimpleVector.h"
 
 #include <fmt/format.h>
 #include <iostream>
 #include <mutex>
 #include <sstream>
+#include <string_view>
 
 namespace facebook::velox::connector::print {
 
@@ -30,6 +32,27 @@ std::mutex& printSinkWriteMutex() {
   static std::mutex m;
   return m;
 }
+
+// Name of the optional trailing column carrying the per-row change kind. Byte
+// values match Flink's RowKind enum: 0=INSERT, 1=UPDATE_BEFORE,
+// 2=UPDATE_AFTER, 3=DELETE.
+constexpr std::string_view kRowKindColumnName = "$row_kind";
+
+// Matches Flink RowKind.shortString(): 0=INSERT -> "+I",
+// 1=UPDATE_BEFORE -> "-U", 2=UPDATE_AFTER -> "+U", 3=DELETE -> "-D".
+const char* rowKindPrefix(int8_t kind) {
+  switch (kind) {
+    case 0:
+      return "+I";
+    case 1:
+      return "-U";
+    case 2:
+      return "+U";
+    case 3:
+      return "-D";
+  }
+  VELOX_FAIL("Unknown RowKind byte: {}", static_cast<int>(kind));
+}
 } // namespace
 
 PrintSink::PrintSink(
@@ -38,10 +61,38 @@ PrintSink::PrintSink(
     bool isStdErr,
     const ConnectorQueryCtx* queryCtx)
     : inputType_(inputType),
+      dataColumnsType_([&] {
+        // Detect trailing $row_kind TINYINT column (the planner augments
+        // print-connector TableWriteNodes with this column so per-row RowKind
+        // reaches this sink).
+        if (inputType->size() > 0 &&
+            inputType->nameOf(inputType->size() - 1) ==
+                std::string(kRowKindColumnName)) {
+          VELOX_CHECK_EQ(
+              inputType->childAt(inputType->size() - 1)->kind(),
+              TypeKind::TINYINT,
+              "trailing {} column must be TINYINT, got {}",
+              kRowKindColumnName,
+              inputType->childAt(inputType->size() - 1)->toString());
+          std::vector<std::string> names;
+          std::vector<TypePtr> types;
+          auto n = inputType->size() - 1;
+          names.reserve(n);
+          types.reserve(n);
+          for (auto i = 0; i < n; ++i) {
+            names.emplace_back(inputType->nameOf(i));
+            types.emplace_back(inputType->childAt(i));
+          }
+          return ROW(std::move(names), std::move(types));
+        }
+        return inputType;
+      }()),
+      rowFormatter_([&] {
+        auto tz = tz::locateZone(queryCtx->sessionTimezone());
+        return createFormatter(dataColumnsType_, tz);
+      }()),
+      hasRowKind_(dataColumnsType_->size() != inputType_->size()),
       queryCtx_(queryCtx),
-      formatter_(createFormatter(
-          inputType_,
-          tz::locateZone(queryCtx->sessionTimezone()))),
       prefix_([&] {
         const auto* props = queryCtx->sessionProperties();
         int parallelism = 1;
@@ -72,16 +123,43 @@ std::string PrintSink::computePrefix(
 }
 
 void PrintSink::appendData(RowVectorPtr input) {
-  VELOX_CHECK_NOT_NULL(formatter_);
-  const auto& inputFields = inputType_->children();
-  VELOX_CHECK_EQ(input->childrenSize(), inputFields.size());
+  VELOX_CHECK_EQ(input->childrenSize(), inputType_->size());
+
+  std::shared_ptr<SimpleVector<int8_t>> rowKindVec;
+  RowVectorPtr dataInput = input;
+  if (hasRowKind_) {
+    auto rowKindIdx = inputType_->size() - 1;
+    rowKindVec = std::dynamic_pointer_cast<SimpleVector<int8_t>>(
+        input->childAt(rowKindIdx));
+    VELOX_CHECK_NOT_NULL(
+        rowKindVec,
+        "$row_kind column must be a SimpleVector<int8_t>, got encoding: {}",
+        input->childAt(rowKindIdx)->encoding());
+    VELOX_CHECK(
+        !rowKindVec->mayHaveNulls(),
+        "{} column must not contain nulls",
+        kRowKindColumnName);
+    // Strip the trailing $row_kind column so the row formatter renders the
+    // data columns only; children and the row nulls bitmap are shared,
+    // nothing is copied.
+    std::vector<VectorPtr> children = input->children();
+    children.pop_back();
+    dataInput = std::make_shared<RowVector>(
+        queryCtx_->memoryPool(),
+        dataColumnsType_,
+        input->nulls(),
+        input->size(),
+        std::move(children));
+  }
 
   std::ostream& stream = isStdErr_ ? static_cast<std::ostream&>(std::cerr)
                                    : static_cast<std::ostream&>(std::cout);
   std::lock_guard<std::mutex> lock(printSinkWriteMutex());
   for (auto i = 0; i < input->size(); ++i) {
+    const char* rowPrefix =
+        hasRowKind_ ? rowKindPrefix(rowKindVec->valueAt(i)) : "+I";
     std::stringstream ss;
-    formatter_->toString(input, inputType_, i, ss);
+    rowFormatter_->toString(dataInput, dataColumnsType_, i, ss, rowPrefix);
     stream << prefix_ << ss.str() << std::endl;
   }
 }
