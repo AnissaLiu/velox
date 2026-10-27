@@ -37,7 +37,6 @@ class FlinkConditionalTest : public functions::test::FunctionBaseTest {
     memory::MemoryManager::testingSetInstance({});
   }
 
-
   void testIfNull(
       const VectorPtr& expected,
       const VectorPtr& a,
@@ -61,8 +60,10 @@ TEST_F(FlinkConditionalTest, ifNullBigint) {
        std::optional<int64_t>(std::nullopt),
        2});
   auto b = makeNullableFlatVector<int64_t>(
-      {10, std::optional<int64_t>(std::nullopt),
-      std::optional<int64_t>(std::nullopt), 20});
+      {10,
+       std::optional<int64_t>(std::nullopt),
+       std::optional<int64_t>(std::nullopt),
+       20});
   auto expected = makeNullableFlatVector<int64_t>(
       {10, 1, std::optional<int64_t>(std::nullopt), 2});
   testIfNull(expected, a, b);
@@ -70,11 +71,13 @@ TEST_F(FlinkConditionalTest, ifNullBigint) {
 
 TEST_F(FlinkConditionalTest, ifNullVarchar) {
   auto a = makeNullableFlatVector<std::string>(
-      {std::optional<std::string>(std::nullopt), "first",
-      std::optional<std::string>(std::nullopt)});
+      {std::optional<std::string>(std::nullopt),
+       "first",
+       std::optional<std::string>(std::nullopt)});
   auto b = makeNullableFlatVector<std::string>(
-      {"fallback", std::optional<std::string>(std::nullopt),
-      std::optional<std::string>(std::nullopt)});
+      {"fallback",
+       std::optional<std::string>(std::nullopt),
+       std::optional<std::string>(std::nullopt)});
   auto expected = makeNullableFlatVector<std::string>(
       {"fallback", "first", std::optional<std::string>(std::nullopt)});
   testIfNull(expected, a, b);
@@ -82,10 +85,11 @@ TEST_F(FlinkConditionalTest, ifNullVarchar) {
 
 TEST_F(FlinkConditionalTest, ifNullDouble) {
   auto a = makeNullableFlatVector<double>(
-      {std::optional<double>(std::nullopt), 1.5,
-      std::optional<double>(std::nullopt)});
-  auto b = makeNullableFlatVector<double>({0.25, 9.0,
-      std::optional<double>(std::nullopt)});
+      {std::optional<double>(std::nullopt),
+       1.5,
+       std::optional<double>(std::nullopt)});
+  auto b = makeNullableFlatVector<double>(
+      {0.25, 9.0, std::optional<double>(std::nullopt)});
   auto expected = makeNullableFlatVector<double>(
       {0.25, 1.5, std::optional<double>(std::nullopt)});
   testIfNull(expected, a, b);
@@ -96,8 +100,7 @@ TEST_F(FlinkConditionalTest, ifNullShortDecimal) {
   auto a = makeNullableFlatVector<int64_t>(
       {1234, std::optional<int64_t>(std::nullopt)}, DECIMAL(10, 2));
   auto b = makeNullableFlatVector<int64_t>({5678, 9999}, DECIMAL(10, 2));
-  auto expected =
-      makeNullableFlatVector<int64_t>({1234, 9999}, DECIMAL(10, 2));
+  auto expected = makeNullableFlatVector<int64_t>({1234, 9999}, DECIMAL(10, 2));
   testIfNull(expected, a, b);
 }
 
@@ -115,10 +118,10 @@ TEST_F(FlinkConditionalTest, ifNullLongDecimal) {
 }
 
 TEST_F(FlinkConditionalTest, ifNullBooleanAndDate) {
-  auto boolA = makeNullableFlatVector<bool>(
-      {std::optional<bool>(std::nullopt), true});
-  auto boolB = makeNullableFlatVector<bool>({false,
-      std::optional<bool>(std::nullopt)});
+  auto boolA =
+      makeNullableFlatVector<bool>({std::optional<bool>(std::nullopt), true});
+  auto boolB =
+      makeNullableFlatVector<bool>({false, std::optional<bool>(std::nullopt)});
   auto boolExpected = makeNullableFlatVector<bool>({false, true});
   testIfNull(boolExpected, boolA, boolB);
 
@@ -128,6 +131,43 @@ TEST_F(FlinkConditionalTest, ifNullBooleanAndDate) {
   auto dateB = makeNullableFlatVector<int32_t>({19700, 20251}, DATE());
   auto dateExpected = makeNullableFlatVector<int32_t>({19700, 20250}, DATE());
   testIfNull(dateExpected, dateA, dateB);
+}
+
+TEST_F(FlinkConditionalTest, ifNullTinyintAndSmallint) {
+  auto tinyA = makeNullableFlatVector<int8_t>(
+      {std::optional<int8_t>(std::nullopt), int8_t{-5}});
+  auto tinyB = makeNullableFlatVector<int8_t>(
+      {int8_t{7}, std::optional<int8_t>(std::nullopt)});
+  auto tinyExpected = makeNullableFlatVector<int8_t>({int8_t{7}, int8_t{-5}});
+  testIfNull(tinyExpected, tinyA, tinyB);
+
+  auto smallA = makeNullableFlatVector<int16_t>(
+      {int16_t{300}, std::optional<int16_t>(std::nullopt)});
+  auto smallB = makeNullableFlatVector<int16_t>({int16_t{-1}, int16_t{4096}});
+  auto smallExpected =
+      makeNullableFlatVector<int16_t>({int16_t{300}, int16_t{4096}});
+  testIfNull(smallExpected, smallA, smallB);
+}
+
+TEST_F(FlinkConditionalTest, ifNullFloatAndTimestamp) {
+  auto floatA = makeNullableFlatVector<float>(
+      {std::optional<float>(std::nullopt),
+       1.5f,
+       std::optional<float>(std::nullopt)});
+  auto floatB = makeNullableFlatVector<float>(
+      {0.25f, 9.0f, std::optional<float>(std::nullopt)});
+  auto floatExpected = makeNullableFlatVector<float>(
+      {0.25f, 1.5f, std::optional<float>(std::nullopt)});
+  testIfNull(floatExpected, floatA, floatB);
+
+  // Timestamps at the exec layer are (seconds, nanos) pairs.
+  auto tsA = makeNullableFlatVector<Timestamp>(
+      {std::optional<Timestamp>(std::nullopt), Timestamp(10, 500)});
+  auto tsB = makeNullableFlatVector<Timestamp>(
+      {Timestamp(5, 0), std::optional<Timestamp>(std::nullopt)});
+  auto tsExpected =
+      makeNullableFlatVector<Timestamp>({Timestamp(5, 0), Timestamp(10, 500)});
+  testIfNull(tsExpected, tsA, tsB);
 }
 
 } // namespace facebook::velox::functions::flinksql::test

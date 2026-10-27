@@ -24,8 +24,7 @@ void registerConditionalFunctions(const std::string& prefix) {
   // operands to their common type, so every supported type needs exactly
   // one same-typed signature (decimals through the generic bindings).
   registerFunction<IfNullFunction, bool, bool, bool>({prefix + "ifnull"});
-  registerFunction<IfNullFunction, int8_t, int8_t, int8_t>(
-      {prefix + "ifnull"});
+  registerFunction<IfNullFunction, int8_t, int8_t, int8_t>({prefix + "ifnull"});
   registerFunction<IfNullFunction, int16_t, int16_t, int16_t>(
       {prefix + "ifnull"});
   registerFunction<IfNullFunction, int32_t, int32_t, int32_t>(
