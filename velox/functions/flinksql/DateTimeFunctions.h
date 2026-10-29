@@ -15,6 +15,7 @@
  */
 #pragma once
 
+#include <chrono>
 #include <limits>
 #include <string_view>
 
@@ -50,6 +51,33 @@ inline std::shared_ptr<DateTimeFormatter> tryGetJodaFormatter(
     return nullptr;
   }
   return formatter.value();
+}
+
+// Flink lenient behavior for DST gap times: Java SimpleDateFormat
+// interprets a non-existent local time (spring-forward gap) using the
+// pre-transition UTC offset. Velox's toGMT() throws instead; this helper
+// recovers by computing the epoch with the pre-gap offset, which is found
+// by converting a guaranteed-to-exist time (one second before the gap).
+inline void resolveDstGap(Timestamp& timestamp, const tz::TimeZone& tz) {
+  const auto wall = std::chrono::seconds(timestamp.getSeconds());
+  // One second before the gap is guaranteed to exist as a local time.
+  const auto utcBefore = tz.to_sys(
+      wall - std::chrono::seconds(1), tz::TimeZone::TChoose::kEarliest);
+  // Pre-transition offset (positive for east of UTC).
+  const auto offset = (wall - std::chrono::seconds(1)) - utcBefore;
+  // Apply the pre-transition offset to the gap time (Java lenient).
+  timestamp = Timestamp((wall - offset).count(), timestamp.getNanos());
+}
+
+// Flink renders FROM_UNIXTIME in the session timezone regardless of the
+// adjust_timestamp_to_timezone flag (that flag governs TIMESTAMP
+// storage/comparison, not rendering).
+inline const tz::TimeZone* getSessionTimeZone(const core::QueryConfig& config) {
+  const auto sessionTzName = config.sessionTimezone();
+  if (!sessionTzName.empty()) {
+    return tz::locateZone(sessionTzName);
+  }
+  return nullptr;
 }
 
 // Flink fails the job on an invalid SimpleDateFormat pattern
@@ -138,7 +166,7 @@ struct FromUnixtimeFunction {
       const std::vector<TypePtr>& /*inputTypes*/,
       const core::QueryConfig& config,
       const arg_type<int64_t>* /*unixtime*/) {
-    sessionTimeZone_ = getTimeZoneFromConfig(config);
+    sessionTimeZone_ = detail::getSessionTimeZone(config);
     formatter_ = detail::getJodaFormatterOrThrow(kDefaultFormat_);
     maxResultSize_ = formatter_->maxResultSize(sessionTimeZone_);
   }
@@ -175,7 +203,7 @@ struct FromUnixtimeWithFormatFunction : public FromUnixtimeFunction<T> {
       const core::QueryConfig& config,
       const arg_type<int64_t>* /*unixtime*/,
       const arg_type<Varchar>* format) {
-    this->sessionTimeZone_ = getTimeZoneFromConfig(config);
+    this->sessionTimeZone_ = detail::getSessionTimeZone(config);
     if (format != nullptr) {
       this->formatter_ = detail::tryGetJodaFormatter(std::string_view(*format));
       isConstantFormat_ = true;
@@ -270,7 +298,18 @@ struct UnixTimestampParseFunction {
     if (needsEpochDefaultYear_) {
       detail::applyEpochDefaultYear(timestamp);
     }
-    timestamp.toGMT(*getTimeZone(dateTimeResult.value()));
+    const auto* tz = getTimeZone(dateTimeResult.value());
+    if (tz != nullptr) {
+      try {
+        timestamp.toGMT(*tz);
+      } catch (const VeloxUserError&) {
+        // Flink lenient: a DST gap local time (e.g. 2005-03-27 02:00:00
+        // in MET where 02:00 does not exist) is interpreted with the
+        // pre-transition offset — the same instant as the first valid
+        // time after the gap (Java SimpleDateFormat behavior).
+        detail::resolveDstGap(timestamp, *tz);
+      }
+    }
     const int64_t millis = timestamp.getSeconds() * 1000 +
         static_cast<int64_t>(timestamp.getNanos()) / 1000000;
     result = millis / 1000;

@@ -32,7 +32,14 @@ constexpr int64_t kMicrosPerMilli = 1'000;
 inline Timestamp plusMillisKeepMicros(
     const Timestamp& ts,
     const int64_t millis) {
-  return Timestamp::fromMicrosNoError(ts.toMicros() + millis * kMicrosPerMilli);
+  // Preserve the sub-microsecond nanosecond remainder: toMicros() truncates
+  // nanoseconds to microsecond boundaries, so the remainder is saved and
+  // re-applied after the arithmetic (sparksql's fromMillis is worse — it
+  // truncates to full milliseconds).
+  const int64_t subMicroNanos = ts.getNanos() % 1'000;
+  Timestamp result =
+      Timestamp::fromMicrosNoError(ts.toMicros() + millis * kMicrosPerMilli);
+  return Timestamp(result.getSeconds(), result.getNanos() + subMicroNanos);
 }
 
 // Flink's DATE + day-time interval keeps the date type and truncates the

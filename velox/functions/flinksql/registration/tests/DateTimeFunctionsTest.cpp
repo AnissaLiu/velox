@@ -79,6 +79,17 @@ TEST_F(DateTimeFunctionsTest, fromUnixtimeSessionTimezone) {
   EXPECT_EQ("2005-03-27 03:00:00", fromUnixtime(1111885200));
 }
 
+TEST_F(DateTimeFunctionsTest, fromUnixtimeSessionTzWithoutAdjustFlag) {
+  // Flink renders FROM_UNIXTIME in the session timezone regardless of the
+  // adjust_timestamp_to_timezone flag (that flag governs TIMESTAMP
+  // storage/comparison, not rendering).
+  queryCtx_->testingOverrideConfigUnsafe({
+      {core::QueryConfig::kSessionTimezone, "Asia/Shanghai"},
+      {core::QueryConfig::kAdjustTimestampToTimezone, "false"},
+  });
+  EXPECT_EQ("1970-01-01 08:00:00", fromUnixtime(0));
+}
+
 TEST_F(DateTimeFunctionsTest, fromUnixtimeCustomFormat) {
   setSessionTimezone("UTC");
   EXPECT_EQ("2025-10-09", fromUnixtime(1760000000, "yyyy-MM-dd"));
@@ -118,11 +129,12 @@ TEST_F(DateTimeFunctionsTest, unixTimestampDstRepeatedTime) {
   EXPECT_EQ(1111885200, unixTimestamp("2005-03-27 03:00:00"));
 }
 
-TEST_F(DateTimeFunctionsTest, unixTimestampDstGapThrows) {
+TEST_F(DateTimeFunctionsTest, unixTimestampDstGapLenient) {
   setSessionTimezone("MET");
   // Flink (lenient SimpleDateFormat) maps the gap time to the pre-transition
-  // offset; velox toGMT fails the conversion instead — known divergence.
-  VELOX_ASSERT_THROW(unixTimestamp("2005-03-27 02:00:00"), "is in a gap");
+  // offset: 2005-03-27 02:00:00 MET (nonexistent) -> 01:00 UTC = 1111885200,
+  // the same instant as 03:00:00 MET after DST starts.
+  EXPECT_EQ(1111885200, unixTimestamp("2005-03-27 02:00:00"));
 }
 
 TEST_F(DateTimeFunctionsTest, unixTimestampNull) {
