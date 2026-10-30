@@ -121,13 +121,15 @@ inline Timestamp plusMillisKeepMicros(
   return Timestamp(result.getSeconds(), result.getNanos() + subMicroNanos);
 }
 
-// Flink's DATE + day-time interval keeps the date type and truncates the
-// time-of-day part of the interval toward negative infinity (25h -> +1 day).
+// Flink's DATE + day-time interval keeps the date type. The time-of-day
+// part of the interval is truncated toward zero: Calcite evaluates
+// date + (intervalMillis / MILLIS_PER_DAY) where the division is Java
+// integer division (truncate toward zero). C++ integer division has the
+// same semantics, so no adjustment is needed.
 inline int32_t plusMillisTruncateToDay(
     const int32_t date,
     const int64_t millis) {
-  const int64_t days =
-      millis / kMillisPerDay - (millis % kMillisPerDay < 0 ? 1 : 0);
+  const int64_t days = millis / kMillisPerDay;
   return static_cast<int32_t>(date + days);
 }
 

@@ -178,9 +178,9 @@ TEST_F(IntervalArithmeticTest, timestampPlusIntervalYearMonth) {
 TEST_F(IntervalArithmeticTest, datePlusInterval) {
   // 2017-11-29 (day 17499) + 25h = 2017-11-30 (day 17500, truncation anchor).
   EXPECT_EQ(17500, plusDate(17499, 25 * kHourMillis));
-  // Negative day-time interval floors: -25h -> -2 days? Flink floorDiv: -1.04
-  // -> -2.
-  EXPECT_EQ(17496, plusDate(17498, -25 * kHourMillis));
+  // Negative day-time interval truncates toward zero (Calcite:
+  // date + intervalMillis / 86400000, Java truncation).
+  EXPECT_EQ(17497, plusDate(17498, -25 * kHourMillis));
   // Date + month clamping: 2025-01-31 (day 20119) + 1M = 2025-02-28 (day
   // 20147).
   EXPECT_EQ(20147, plusDateMonths(20119, 1));
@@ -195,6 +195,35 @@ TEST_F(IntervalArithmeticTest, intervalMultiply) {
   EXPECT_EQ(-2 * kHourMillis, multiplyInterval(kHourMillis, -2));
   EXPECT_EQ(std::nullopt, multiplyInterval(kHourMillis, std::nullopt));
   EXPECT_EQ(6, multiplyMonths(3, 2));
+}
+
+TEST_F(IntervalArithmeticTest, timestampPlusMinusIntervalPreservesNanos) {
+  // Sub-microsecond nanoseconds must survive interval arithmetic:
+  // .123456789 + 1ms = .124456789, .123456789 - 1ms = .122456789.
+  const int64_t sec = 1511947138;
+  const uint64_t nanos = 123456789;
+  Timestamp ts(sec, nanos);
+
+  // IntervalDayTime is in milliseconds: 1ms = 1000 micros.
+  auto plus = evaluateOnce<Timestamp>(
+      "plus(c0, c1)",
+      makeRowVector({
+          makeNullableFlatVector<Timestamp>({ts}, TIMESTAMP()),
+          makeNullableFlatVector<int64_t>({1}, INTERVAL_DAY_TIME()),
+      }));
+  ASSERT_TRUE(plus.has_value());
+  EXPECT_EQ(sec, plus->getSeconds());
+  EXPECT_EQ(124456789, plus->getNanos());
+
+  auto minus = evaluateOnce<Timestamp>(
+      "minus(c0, c1)",
+      makeRowVector({
+          makeNullableFlatVector<Timestamp>({ts}, TIMESTAMP()),
+          makeNullableFlatVector<int64_t>({1}, INTERVAL_DAY_TIME()),
+      }));
+  ASSERT_TRUE(minus.has_value());
+  EXPECT_EQ(sec, minus->getSeconds());
+  EXPECT_EQ(122456789, minus->getNanos());
 }
 
 } // namespace
