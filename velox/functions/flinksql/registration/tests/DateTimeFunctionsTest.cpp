@@ -156,9 +156,13 @@ TEST_F(DateTimeFunctionsTest, unixTimestampUnparseableReturnsMin) {
 TEST_F(DateTimeFunctionsTest, unixTimestampLenientCalendar) {
   setSessionTimezone("UTC");
   // Flink lenient: 2025-02-30 rolls to 2025-03-02.
-  // Note: velox Joda still rejects this — known divergence, returns
-  // Long.MIN_VALUE (Flink returns 1740873600).
-  EXPECT_EQ(kMinBigint, unixTimestamp("2025-02-30", "yyyy-MM-dd"));
+  EXPECT_EQ(1740873600, unixTimestamp("2025-02-30", "yyyy-MM-dd"));
+  // Flink lenient: month 13 rolls to next year.
+  EXPECT_EQ(1767225600, unixTimestamp("2025-13-01", "yyyy-MM-dd"));
+  // Flink lenient: day 32 in January rolls to February 1.
+  EXPECT_EQ(1738368000, unixTimestamp("2025-01-32", "yyyy-MM-dd"));
+  // Flink lenient: Feb 29 in non-leap year rolls to March 1.
+  EXPECT_EQ(1740787200, unixTimestamp("2025-02-29", "yyyy-MM-dd"));
 }
 
 TEST_F(DateTimeFunctionsTest, unixTimestampMillisecondTruncation) {

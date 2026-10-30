@@ -15,7 +15,9 @@
  */
 #pragma once
 
+#include <cctype>
 #include <chrono>
+#include <cstring>
 #include <limits>
 #include <string_view>
 
@@ -23,6 +25,7 @@
 #include "velox/functions/lib/DateTimeFormatterBuilder.h"
 #include "velox/functions/lib/TimeUtils.h"
 #include "velox/type/Timestamp.h"
+#include "velox/type/TimestampConversion.h"
 
 namespace facebook::velox::functions::flinksql {
 
@@ -83,37 +86,359 @@ inline const tz::TimeZone* getSessionTimeZone(const core::QueryConfig& config) {
 // Flink's SimpleDateFormat is lenient in two ways that velox's Joda
 // formatter is not:
 // 1. Calendar-invalid dates (e.g. '2025-02-30') roll to the next valid
-//    date ('2025-03-02').
+//    date ('2025-03-02') via field overflow (Java Calendar lenient mode).
 // 2. Trailing text after a valid prefix is ignored (e.g.
 //    '2026-09-11 10:00:00 xyz' parses as '2026-09-11 10:00:00').
-// This helper first tries the full input; on failure it retries with
-// the longest prefix that ends at a whitespace or format boundary.
-// Only when no prefix is parseable does it return the error.
+//
+// Lenient calendar algorithm (mathematically equivalent to Java
+// GregorianCalendar.computeTime()):
+//   totalMonths = year * 12 + (month - 1)
+//   normYear    = totalMonths / 12
+//   normMonth   = totalMonths % 12 + 1
+//   epochDays   = daysSinceEpoch(normYear, normMonth, 1) + (day - 1)
+//   epochSecs   = epochDays * 86400 + hour * 3600 + minute * 60 + second
+// Day/month/hour/minute/second overflow carries into the next field
+// naturally (month 13 -> next year Jan, day 30 in Feb -> Mar 2, etc.).
+
+// Raw field values extracted from the input string, without any range
+// validation. Defaults match Flink's Calendar defaults (Jan 1, 00:00:00).
+struct LenientDate {
+  int32_t year = 1970;
+  int32_t month = 1;
+  int32_t day = 1;
+  int32_t hour = 0;
+  int32_t minute = 0;
+  int32_t second = 0;
+  int32_t dayOfYear = -1; // -1 = not present
+  bool hasYear = false;
+  bool isAm = true; // AM/PM
+  bool hasAmPm = false;
+  bool isHourOfHalfDay = false; // hh or KK (1-12)
+};
+
+// Extracts a numeric field of at least minDigits digits from input.
+// Returns the value and advances cur, or returns -1.
+inline int64_t
+extractNumeric(const char*& cur, const char* end, size_t minDigits) {
+  const char* start = cur;
+  int64_t value = 0;
+  while (cur < end && std::isdigit(static_cast<unsigned char>(*cur)) &&
+         static_cast<size_t>(cur - start) < minDigits + 10) {
+    value = value * 10 + (*cur - '0');
+    ++cur;
+  }
+  if (static_cast<size_t>(cur - start) < minDigits) {
+    return -1;
+  }
+  return value;
+}
+
+// Extracts text month (Jan/Feb/... or full names) and returns 1-12, or -1.
+inline int32_t extractMonthText(const char*& cur, const char* end) {
+  static const std::pair<std::string_view, int32_t> months[] = {
+      {"Jan", 1},
+      {"Feb", 2},
+      {"Mar", 3},
+      {"Apr", 4},
+      {"May", 5},
+      {"Jun", 6},
+      {"Jul", 7},
+      {"Aug", 8},
+      {"Sep", 9},
+      {"Oct", 10},
+      {"Nov", 11},
+      {"Dec", 12},
+  };
+  static const std::pair<std::string_view, int32_t> fullMonths[] = {
+      {"January", 1},
+      {"February", 2},
+      {"March", 3},
+      {"April", 4},
+      {"May", 5},
+      {"June", 6},
+      {"July", 7},
+      {"August", 8},
+      {"September", 9},
+      {"October", 10},
+      {"November", 11},
+      {"December", 12},
+  };
+  if (end - cur >= 9) {
+    for (const auto& [name, val] : fullMonths) {
+      if (end - cur >= static_cast<int64_t>(name.size()) &&
+          std::strncmp(cur, name.data(), name.size()) == 0) {
+        cur += name.size();
+        return val;
+      }
+    }
+  }
+  if (end - cur >= 3) {
+    for (const auto& [name, val] : months) {
+      if (end - cur >= 3 && std::strncmp(cur, name.data(), 3) == 0) {
+        cur += 3;
+        return val;
+      }
+    }
+  }
+  return -1;
+}
+
+// Extracts AM/PM and advances cur, or returns -1.
+inline int32_t extractAmPm(const char*& cur, const char* end) {
+  if (end - cur >= 2) {
+    if (std::strncmp(cur, "AM", 2) == 0 || std::strncmp(cur, "am", 2) == 0) {
+      cur += 2;
+      return 1; // AM
+    }
+    if (std::strncmp(cur, "PM", 2) == 0 || std::strncmp(cur, "pm", 2) == 0) {
+      cur += 2;
+      return 0; // PM
+    }
+  }
+  return -1;
+}
+
+// Skips a day-of-week text token (Mon/Monday, etc.) without using its value.
+// Java Calendar ignores day-of-week when a full date is present.
+inline bool skipDayOfWeekText(const char*& cur, const char* end) {
+  static const std::string_view days[] = {
+      "Monday",
+      "Tuesday",
+      "Wednesday",
+      "Thursday",
+      "Friday",
+      "Saturday",
+      "Sunday",
+      "Mon",
+      "Tue",
+      "Wed",
+      "Thu",
+      "Fri",
+      "Sat",
+      "Sun",
+  };
+  for (const auto& name : days) {
+    if (end - cur >= static_cast<int64_t>(name.size()) &&
+        std::strncmp(cur, name.data(), name.size()) == 0) {
+      cur += name.size();
+      return true;
+    }
+  }
+  return false;
+}
+
+// Walks formatter tokens and extracts raw field values from input.
+// Returns true if all tokens matched (literals matched, fields extracted).
+// Does NOT validate field ranges — lenient carry rules handle overflow.
+inline bool extractFields(
+    const DateTimeFormatter& formatter,
+    const std::string_view input,
+    LenientDate& date) {
+  const char* cur = input.data();
+  const char* end = input.data() + input.size();
+  const auto& tokens = formatter.tokens();
+
+  for (const auto& token : tokens) {
+    if (token.type == DateTimeToken::Type::kLiteral) {
+      // Match literal text (must match exactly)
+      const auto& lit = token.literal;
+      if (end - cur < static_cast<int64_t>(lit.size()) ||
+          std::strncmp(cur, lit.data(), lit.size()) != 0) {
+        return false;
+      }
+      cur += lit.size();
+      continue;
+    }
+
+    const auto& spec = token.pattern.specifier;
+    const size_t minDigits = token.pattern.minRepresentDigits;
+
+    switch (spec) {
+      case DateTimeFormatSpecifier::YEAR:
+      case DateTimeFormatSpecifier::YEAR_OF_ERA: {
+        int64_t v = extractNumeric(cur, end, minDigits);
+        if (v < 0)
+          return false;
+        date.year = static_cast<int32_t>(v);
+        date.hasYear = true;
+        break;
+      }
+      case DateTimeFormatSpecifier::CENTURY_OF_ERA: {
+        int64_t v = extractNumeric(cur, end, minDigits);
+        if (v < 0)
+          return false;
+        date.year = static_cast<int32_t>(v) * 100;
+        date.hasYear = true;
+        break;
+      }
+      case DateTimeFormatSpecifier::MONTH_OF_YEAR: {
+        int64_t v = extractNumeric(cur, end, minDigits);
+        if (v < 0)
+          return false;
+        date.month = static_cast<int32_t>(v);
+        break;
+      }
+      case DateTimeFormatSpecifier::MONTH_OF_YEAR_TEXT: {
+        int32_t v = extractMonthText(cur, end);
+        if (v < 0)
+          return false;
+        date.month = v;
+        break;
+      }
+      case DateTimeFormatSpecifier::DAY_OF_MONTH: {
+        int64_t v = extractNumeric(cur, end, minDigits);
+        if (v < 0)
+          return false;
+        date.day = static_cast<int32_t>(v);
+        break;
+      }
+      case DateTimeFormatSpecifier::DAY_OF_YEAR: {
+        int64_t v = extractNumeric(cur, end, minDigits);
+        if (v < 0)
+          return false;
+        date.dayOfYear = static_cast<int32_t>(v);
+        break;
+      }
+      case DateTimeFormatSpecifier::HOUR_OF_DAY: {
+        int64_t v = extractNumeric(cur, end, minDigits);
+        if (v < 0)
+          return false;
+        date.hour = static_cast<int32_t>(v);
+        break;
+      }
+      case DateTimeFormatSpecifier::HOUR_OF_HALFDAY:
+      case DateTimeFormatSpecifier::CLOCK_HOUR_OF_HALFDAY: {
+        int64_t v = extractNumeric(cur, end, minDigits);
+        if (v < 0)
+          return false;
+        date.hour = static_cast<int32_t>(v);
+        date.isHourOfHalfDay = true;
+        break;
+      }
+      case DateTimeFormatSpecifier::MINUTE_OF_HOUR: {
+        int64_t v = extractNumeric(cur, end, minDigits);
+        if (v < 0)
+          return false;
+        date.minute = static_cast<int32_t>(v);
+        break;
+      }
+      case DateTimeFormatSpecifier::SECOND_OF_MINUTE: {
+        int64_t v = extractNumeric(cur, end, minDigits);
+        if (v < 0)
+          return false;
+        date.second = static_cast<int32_t>(v);
+        break;
+      }
+      case DateTimeFormatSpecifier::FRACTION_OF_SECOND: {
+        int64_t v = extractNumeric(cur, end, minDigits);
+        if (v < 0)
+          return false;
+        // Fraction is truncated toward zero in unix_timestamp; ignore value.
+        break;
+      }
+      case DateTimeFormatSpecifier::HALFDAY_OF_DAY: {
+        int32_t v = extractAmPm(cur, end);
+        if (v < 0)
+          return false;
+        date.hasAmPm = true;
+        date.isAm = (v == 1);
+        break;
+      }
+      case DateTimeFormatSpecifier::DAY_OF_WEEK_TEXT: {
+        // Java ignores day-of-week when a full date is present.
+        if (!skipDayOfWeekText(cur, end))
+          return false;
+        break;
+      }
+      case DateTimeFormatSpecifier::DAY_OF_WEEK_0_BASED:
+      case DateTimeFormatSpecifier::DAY_OF_WEEK_1_BASED: {
+        int64_t v = extractNumeric(cur, end, minDigits);
+        if (v < 0)
+          return false;
+        // Day-of-week is ignored when a full date is present.
+        break;
+      }
+      default:
+        // TIMEZONE, WEEK_YEAR, etc. — not supported in lenient parsing.
+        return false;
+    }
+  }
+  // All tokens consumed successfully.
+  return cur == end || std::isspace(static_cast<unsigned char>(*cur));
+}
+
+// Computes the wall-clock epoch seconds from raw field values using
+// Java Calendar's lenient carry rules. All fields participate in
+// arithmetic and overflow carries into the next larger field.
+inline int64_t lenientEpochSeconds(const LenientDate& date) {
+  // Apply AM/PM to hour if present.
+  int32_t hour = date.hour;
+  if (date.hasAmPm && date.isHourOfHalfDay) {
+    if (!date.isAm && hour < 12) {
+      hour += 12;
+    } else if (date.isAm && hour == 12) {
+      hour = 0;
+    }
+  }
+
+  // Handle day-of-year format (no month/day split).
+  if (date.dayOfYear >= 1) {
+    // Jan 1 of the year + (dayOfYear - 1) days.
+    // Month is not used in this mode.
+    const int64_t jan1Days =
+        util::daysSinceEpochFromDate(date.year, 1, 1).value();
+    return jan1Days * 86400 + (date.dayOfYear - 1) * 86400 + hour * 3600 +
+        date.minute * 60 + date.second;
+  }
+
+  // Month carry: month 13 -> next year Jan; month 0 -> prev year Dec.
+  const int64_t totalMonths =
+      static_cast<int64_t>(date.year) * 12 + (date.month - 1);
+  const int32_t normYear = static_cast<int32_t>(totalMonths / 12);
+  const int32_t normMonth = static_cast<int32_t>(totalMonths % 12) + 1;
+
+  // Day carry: day 30 in Feb -> Mar 2 (daysSinceEpoch of 1st + day-1).
+  const int64_t firstOfMonth =
+      util::daysSinceEpochFromDate(normYear, normMonth, 1).value();
+  const int64_t epochDays = firstOfMonth + (date.day - 1);
+
+  // Time carry: hour 25 -> next day 1:00, etc.
+  return epochDays * 86400 + hour * 3600 + date.minute * 60 + date.second;
+}
+
+// Parses input with Flink lenient semantics. First tries the full
+// strict Joda parse; on failure, retries with progressively shorter
+// whitespace-delimited prefixes for trailing text tolerance; if that
+// still fails, falls back to raw field extraction with calendar
+// leniency. Returns Long.MIN_VALUE sentinel if nothing works.
 inline folly::Expected<DateTimeResult, Status> parseLenient(
     const std::shared_ptr<DateTimeFormatter>& formatter,
     const std::string_view input) {
+  // 1. Try strict Joda parse (handles well-formed input).
   auto result = formatter->parse(input);
   if (!result.hasError()) {
     return result;
   }
-  // Trailing-text tolerance: find the longest whitespace-delimited prefix
-  // and try parsing that. Flink's SimpleDateFormat.parse() ignores text
-  // after the matched pattern.
+
+  // 2. Trailing-text tolerance: try longest whitespace-delimited prefix.
   for (size_t end = input.size(); end > 0; --end) {
-    if (end == input.size() &&
-        std::isspace(static_cast<unsigned char>(input[end - 1]))) {
-      continue;
-    }
-    if (std::isspace(static_cast<unsigned char>(input[end - 1]))) {
-      auto prefixResult = formatter->parse(input.substr(0, end - 1));
+    if (end < input.size() &&
+        std::isspace(static_cast<unsigned char>(input[end]))) {
+      auto prefixResult = formatter->parse(input.substr(0, end));
       if (!prefixResult.hasError()) {
         return prefixResult;
       }
     }
   }
-  // Try the full input one more time in case the initial failure was a
-  // calendar-invalid date (Joda strict) rather than trailing text — the
-  // caller's gap/lenient handling may resolve it downstream.
+
+  // 3. Calendar leniency: extract raw fields and apply carry rules.
+  LenientDate date;
+  if (extractFields(*formatter, input, date)) {
+    const int64_t seconds = lenientEpochSeconds(date);
+    return DateTimeResult{Timestamp(seconds, 0), nullptr};
+  }
+
+  // Nothing worked — return the original error.
   return result;
 }
 
