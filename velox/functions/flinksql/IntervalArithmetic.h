@@ -16,8 +16,14 @@
 #pragma once
 
 #include "velox/functions/Macros.h"
-#include "velox/functions/prestosql/DateTimeImpl.h"
 
+#include "velox/functions/lib/DateTimeFormatter.h"
+#include "velox/type/Timestamp.h"
+
+#include <date/date.h>
+#include <chrono>
+
+#include "velox/functions/lib/DateTimeFormatter.h"
 #include "velox/type/Timestamp.h"
 
 namespace facebook::velox::functions::flinksql {
@@ -26,6 +32,79 @@ namespace detail {
 
 constexpr int64_t kMillisPerDay = 86'400'000;
 constexpr int64_t kMicrosPerMilli = 1'000;
+
+// Calendar-aware date add with end-of-month clamping, copied from
+// prestosql/DateTimeImpl.h to avoid a cross-namespace include.
+// 2022-01-30 + 1 month = 2022-02-28 (clamped).
+inline int32_t
+addToDate(const int32_t input, const DateTimeUnit unit, const int32_t value) {
+  if (value == 0) {
+    return input;
+  }
+  const std::chrono::time_point<std::chrono::system_clock, date::days> inDate{
+      date::days(input)};
+  std::chrono::time_point<std::chrono::system_clock, date::days> outDate;
+  if (unit == DateTimeUnit::kDay) {
+    outDate = inDate + date::days(value);
+  } else if (unit == DateTimeUnit::kWeek) {
+    outDate = inDate + date::days(value * 7);
+  } else {
+    const date::year_month_day inCalDate(inDate);
+    date::year_month_day outCalDate;
+    if (unit == DateTimeUnit::kMonth) {
+      outCalDate = inCalDate + date::months(value);
+    } else if (unit == DateTimeUnit::kQuarter) {
+      outCalDate = inCalDate + date::months(3 * value);
+    } else if (unit == DateTimeUnit::kYear) {
+      outCalDate = inCalDate + date::years(value);
+    } else {
+      VELOX_UNREACHABLE();
+    }
+    if (!outCalDate.ok()) {
+      outCalDate = outCalDate.year() / outCalDate.month() / date::last;
+    }
+    outDate = date::sys_days{outCalDate};
+  }
+  return outDate.time_since_epoch().count();
+}
+
+// Timezone-naive wall-calendar timestamp add (Flink semantics).
+// Copies the no-timezone overload of addToTimestamp from
+// prestosql/DateTimeImpl.h.
+inline Timestamp addToTimestamp(
+    const Timestamp& timestamp,
+    const DateTimeUnit unit,
+    const int32_t value) {
+  if (value == 0) {
+    return timestamp;
+  }
+  const std::chrono::
+      time_point<std::chrono::system_clock, std::chrono::milliseconds>
+          inTimestamp(std::chrono::milliseconds(timestamp.toMillis()));
+  std::chrono::time_point<std::chrono::system_clock, std::chrono::milliseconds>
+      outTimestamp;
+  switch (unit) {
+    case DateTimeUnit::kYear:
+    case DateTimeUnit::kQuarter:
+    case DateTimeUnit::kMonth:
+    case DateTimeUnit::kDay: {
+      const int32_t inDate =
+          std::chrono::duration_cast<date::days>(inTimestamp.time_since_epoch())
+              .count();
+      const int32_t outDate = addToDate(inDate, unit, value);
+      outTimestamp = inTimestamp + date::days(outDate - inDate);
+      break;
+    }
+    default:
+      VELOX_UNREACHABLE();
+  }
+  Timestamp milliTimestamp =
+      Timestamp::fromMillis(outTimestamp.time_since_epoch().count());
+  return Timestamp(
+      milliTimestamp.getSeconds(),
+      milliTimestamp.getNanos() +
+          timestamp.getNanos() % static_cast<uint64_t>(kMicrosPerMilli));
+}
 
 // Flink adds interval millis to a TIMESTAMP keeping its sub-millisecond part
 // (presto's fromMillis(a.toMillis()+b) would truncate it).
@@ -90,7 +169,7 @@ struct TimestampPlusIntervalYearMonthFunction {
       out_type<Timestamp>& result,
       const arg_type<Timestamp>& a,
       const arg_type<IntervalYearMonth>& b) {
-    result = addToTimestamp(a, DateTimeUnit::kMonth, b);
+    result = detail::addToTimestamp(a, DateTimeUnit::kMonth, b);
     return true;
   }
 };
@@ -102,11 +181,13 @@ struct TimestampMinusIntervalYearMonthFunction {
       out_type<Timestamp>& result,
       const arg_type<Timestamp>& a,
       const arg_type<IntervalYearMonth>& b) {
-    result = addToTimestamp(a, DateTimeUnit::kMonth, -b);
+    result = detail::addToTimestamp(a, DateTimeUnit::kMonth, -b);
     return true;
   }
 };
 
+// Flink TIMESTAMPADD(HOUR/MINUTE/SECOND, n, DATE) returns a TIMESTAMP:
+// days * 86400000 +/- interval millis, with a TIMESTAMP result type.
 // Date +/- interval: Flink keeps the DATE type.
 template <typename T>
 struct DatePlusIntervalDayTimeFunction {
@@ -127,7 +208,7 @@ struct DatePlusIntervalYearMonthFunction {
       out_type<Date>& result,
       const arg_type<Date>& date,
       const arg_type<IntervalYearMonth>& interval) {
-    result = addToDate(date, DateTimeUnit::kMonth, interval);
+    result = detail::addToDate(date, DateTimeUnit::kMonth, interval);
     return true;
   }
 };
@@ -151,7 +232,7 @@ struct DateMinusIntervalYearMonthFunction {
       out_type<Date>& result,
       const arg_type<Date>& date,
       const arg_type<IntervalYearMonth>& interval) {
-    result = addToDate(date, DateTimeUnit::kMonth, -interval);
+    result = detail::addToDate(date, DateTimeUnit::kMonth, -interval);
     return true;
   }
 };

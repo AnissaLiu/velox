@@ -12,7 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-add_executable(velox_flinksql_temporal_test DateTimeFunctionsTest.cpp IntervalArithmeticTest.cpp)
+add_executable(
+  velox_flinksql_temporal_test
+  DateTimeFunctionsTest.cpp
+  IntervalArithmeticTest.cpp)
 
 add_test(velox_flinksql_temporal_test velox_flinksql_temporal_test)
 

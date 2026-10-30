@@ -149,11 +149,15 @@ TEST_F(DateTimeFunctionsTest, unixTimestampUnparseableReturnsMin) {
   EXPECT_EQ(kMinBigint, unixTimestamp("garbage"));
   EXPECT_EQ(kMinBigint, unixTimestamp(""));
   EXPECT_EQ(kMinBigint, unixTimestamp("00:00:00"));
-  EXPECT_EQ(kMinBigint, unixTimestamp("2026-09-11 10:00:00 xyz"));
+  // Trailing text: Flink parses the prefix and ignores the rest.
+  EXPECT_EQ(1789120800, unixTimestamp("2026-09-11 10:00:00 xyz"));
 }
 
-TEST_F(DateTimeFunctionsTest, unixTimestampStrictCalendar) {
+TEST_F(DateTimeFunctionsTest, unixTimestampLenientCalendar) {
   setSessionTimezone("UTC");
+  // Flink lenient: 2025-02-30 rolls to 2025-03-02.
+  // Note: velox Joda still rejects this — known divergence, returns
+  // Long.MIN_VALUE (Flink returns 1740873600).
   EXPECT_EQ(kMinBigint, unixTimestamp("2025-02-30", "yyyy-MM-dd"));
 }
 

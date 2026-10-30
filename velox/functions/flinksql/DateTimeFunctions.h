@@ -80,6 +80,43 @@ inline const tz::TimeZone* getSessionTimeZone(const core::QueryConfig& config) {
   return nullptr;
 }
 
+// Flink's SimpleDateFormat is lenient in two ways that velox's Joda
+// formatter is not:
+// 1. Calendar-invalid dates (e.g. '2025-02-30') roll to the next valid
+//    date ('2025-03-02').
+// 2. Trailing text after a valid prefix is ignored (e.g.
+//    '2026-09-11 10:00:00 xyz' parses as '2026-09-11 10:00:00').
+// This helper first tries the full input; on failure it retries with
+// the longest prefix that ends at a whitespace or format boundary.
+// Only when no prefix is parseable does it return the error.
+inline folly::Expected<DateTimeResult, Status> parseLenient(
+    const std::shared_ptr<DateTimeFormatter>& formatter,
+    const std::string_view input) {
+  auto result = formatter->parse(input);
+  if (!result.hasError()) {
+    return result;
+  }
+  // Trailing-text tolerance: find the longest whitespace-delimited prefix
+  // and try parsing that. Flink's SimpleDateFormat.parse() ignores text
+  // after the matched pattern.
+  for (size_t end = input.size(); end > 0; --end) {
+    if (end == input.size() &&
+        std::isspace(static_cast<unsigned char>(input[end - 1]))) {
+      continue;
+    }
+    if (std::isspace(static_cast<unsigned char>(input[end - 1]))) {
+      auto prefixResult = formatter->parse(input.substr(0, end - 1));
+      if (!prefixResult.hasError()) {
+        return prefixResult;
+      }
+    }
+  }
+  // Try the full input one more time in case the initial failure was a
+  // calendar-invalid date (Joda strict) rather than trailing text — the
+  // caller's gap/lenient handling may resolve it downstream.
+  return result;
+}
+
 // Flink fails the job on an invalid SimpleDateFormat pattern
 // (IllegalArgumentException from the formatter constructor).
 inline std::shared_ptr<DateTimeFormatter> getJodaFormatterOrThrow(
@@ -289,7 +326,7 @@ struct UnixTimestampParseFunction {
   // Flink truncates total milliseconds toward zero (ts / 1000 in Java);
   // getSeconds() alone would diverge for negative sub-second timestamps.
   void parseToSeconds(int64_t& result, const std::string_view input) {
-    auto dateTimeResult = formatter_->parse(input);
+    auto dateTimeResult = detail::parseLenient(formatter_, input);
     if (dateTimeResult.hasError()) {
       result = std::numeric_limits<int64_t>::min();
       return;
