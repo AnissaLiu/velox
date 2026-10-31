@@ -13,7 +13,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include "velox/functions/flinksql/registration/RegistrationFunctions.h"
+#include "velox/functions/flinksql/TemporalFunctions.h"
 
 #include "velox/functions/Registerer.h"
 #include "velox/functions/flinksql/DateTimeFunctions.h"
@@ -88,6 +88,9 @@ void registerTemporalFunctions(const std::string& prefix) {
       IntervalYearMonth,
       IntervalYearMonth,
       int64_t>({prefix + "multiply"});
+
+  registerFunction<CurrentDateFunction, Date>({prefix + "current_date"});
+  registerFunction<CurrentTimeFunction, int32_t>({prefix + "current_time"});
 }
 
 } // namespace facebook::velox::functions::flinksql
