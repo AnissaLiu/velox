@@ -23,6 +23,12 @@ namespace facebook::velox::connector {
 const FormatterPtr createFormatter(
     const TypePtr& type,
     const tz::TimeZone* timeZone) {
+  // DateType::kind() is INTEGER, so a DATE field would silently fall into the
+  // INTEGER formatter (which parses 'YYYY-MM-DD' as 0); dispatch on the type
+  // before consulting the kind.
+  if (type->isDate()) {
+    return std::make_shared<DateFormatter>(timeZone);
+  }
   TypeKind typeKind = type->kind();
   switch (typeKind) {
     case TypeKind::INTEGER:

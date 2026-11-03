@@ -16,7 +16,10 @@
 #include "velox/connectors/utils/tests/StringFormatterTest.h"
 #include "velox/connectors/utils/StringFormatter.h"
 #include "velox/type/Type.h"
+#include "velox/vector/BaseVector.h"
+#include "velox/vector/ComplexVector.h"
 #include "velox/vector/FlatVector.h"
+#include "velox/vector/SimpleVector.h"
 
 #include <folly/init/Init.h>
 #include <gtest/gtest.h>
@@ -173,6 +176,44 @@ TEST_F(StringFormatterTest, testStringToTimestamp) {
   ASSERT_TRUE(s8 == "2025-09-08T22:14:12");
   ASSERT_TRUE(s9 == "2025-09-08T15:59:12");
   ASSERT_TRUE(s10 == "2025-09-08T22:29:12");
+}
+
+TEST_F(StringFormatterTest, testDateFormatterRoundTrip) {
+  // Field-level round trip: parse YYYY-MM-DD into epoch days and render back.
+  DateFormatter formatter;
+  TypePtr dateType = DATE();
+  VectorPtr vec = FlatVector<int32_t>::create(dateType, 4, memoryPool.get());
+  formatter.fromString("2017-11-29", dateType, 0, vec);
+  formatter.fromString("1970-01-02", dateType, 1, vec);
+  formatter.fromString("2025-01-31", dateType, 2, vec);
+  formatter.fromString("null", dateType, 3, vec);
+  ASSERT_EQ(vec->asFlatVector<int32_t>()->valueAt(0), 17499);
+  ASSERT_EQ(vec->asFlatVector<int32_t>()->valueAt(1), 1);
+  ASSERT_TRUE(vec->isNullAt(3));
+
+  std::stringstream ss;
+  formatter.toString(vec, dateType, 0, ss);
+  ASSERT_TRUE(ss.str() == "2017-11-29");
+  std::stringstream ssNull;
+  formatter.toString(vec, dateType, 3, ssNull);
+  ASSERT_TRUE(ssNull.str() == "null");
+
+  // Row-level round trip through createFormatter: the from-elements connector
+  // rebuilds a ROW(BIGINT, DATE) from its "+I[a, d]" string form.
+  auto rowType = ROW({{"a", BIGINT()}, {"d", DATE()}});
+  auto rowFormatter = createFormatter(rowType, tz::locateZone("UTC"));
+  auto row = RowVector::createEmpty(rowType, memoryPool.get());
+  row->resize(1);
+  VectorPtr rowVec = std::dynamic_pointer_cast<BaseVector>(row);
+  rowFormatter->fromString("+I[7, 2025-01-31]", rowType, 0, rowVec);
+  ASSERT_EQ(
+      row->childAt(0)->as<SimpleVector<int64_t>>()->valueAt(0), 7);
+  ASSERT_EQ(
+      row->childAt(1)->as<SimpleVector<int32_t>>()->valueAt(0),
+      vec->asFlatVector<int32_t>()->valueAt(2));
+  std::stringstream rowSs;
+  rowFormatter->toString(rowVec, rowType, 0, rowSs);
+  ASSERT_TRUE(rowSs.str() == "+I[7, 2025-01-31]");
 }
 
 } // namespace facebook::velox::connector::test

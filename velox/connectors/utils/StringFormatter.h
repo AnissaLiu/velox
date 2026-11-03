@@ -19,9 +19,11 @@
 #include <boost/algorithm/string/erase.hpp>
 #include <boost/algorithm/string/replace.hpp>
 #include <boost/algorithm/string/split.hpp>
+#include <date/date.h>
 #include <folly/Try.h>
 #include <ctime>
 #include <memory>
+#include <sstream>
 #include <string>
 #include <type_traits>
 #include "velox/expression/CastExpr.h"
@@ -236,6 +238,47 @@ struct DefaultFormatter : public StringFormatter {
     } else {
       VELOX_FAIL("Not supported type: {}", typeid(T).name());
     }
+  }
+};
+
+// DATE is stored as int32 days since epoch. Renders and parses the ISO
+// YYYY-MM-DD form, matching Flink's LocalDate.toString() so the from-elements
+// connector can round-trip rows that carry a DATE field.
+struct DateFormatter : public StringFormatter {
+ public:
+  DateFormatter(const tz::TimeZone* timeZone) : StringFormatter(timeZone) {}
+  DateFormatter() : StringFormatter() {}
+
+  const void toString(
+      const VectorPtr& input,
+      const TypePtr&,
+      const size_t index,
+      std::stringstream& ss,
+      const char* /*rowKindPrefix*/ = "+I") override {
+    if (input->isNullAt(index)) {
+      ss << "null";
+      return;
+    }
+    const int32_t days = input->as<SimpleVector<int32_t>>()->valueAt(index);
+    ss << date::year_month_day{date::sys_days{date::days(days)}};
+  }
+
+  const void fromString(
+      const std::string& s,
+      const TypePtr&,
+      const size_t index,
+      VectorPtr& vec) override {
+    if (s == "null") {
+      vec->setNull(index, true);
+      return;
+    }
+    std::istringstream is{s};
+    date::year_month_day ymd;
+    is >> date::parse("%F", ymd);
+    VELOX_CHECK(
+        !is.fail() && ymd.ok(), "Failed to format {} to type DATE", s);
+    const auto days = date::sys_days{ymd}.time_since_epoch().count();
+    vec->as<FlatVector<int32_t>>()->set(index, static_cast<int32_t>(days));
   }
 };
 
