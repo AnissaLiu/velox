@@ -32,6 +32,9 @@ add_executable(velox_stateful_stream_record_test StreamRecordTest.cpp)
 
 add_executable(velox_stateful_calc_operator_test StatefulCalcOperatorTest.cpp)
 
+add_executable(velox_stateful_record_clock_refresh_test
+               RecordClockRefreshTest.cpp)
+
 add_test(velox_stateful_watermark_generator_test
          velox_stateful_watermark_generator_test)
 
@@ -53,6 +56,9 @@ add_test(velox_stateful_stream_partition_test
 add_test(velox_stateful_stream_record_test velox_stateful_stream_record_test)
 
 add_test(velox_stateful_calc_operator_test velox_stateful_calc_operator_test)
+
+add_test(velox_stateful_record_clock_refresh_test
+         velox_stateful_record_clock_refresh_test)
 
 target_link_libraries(
   velox_stateful_combined_watermark_status_test velox_common_base GTest::gtest
@@ -144,12 +150,124 @@ target_link_libraries(
   GTest::gtest
   GTest::gtest_main)
 
+# W4 evaluates the real flinksql temporal functions inside a stateful chain, so
+# the flinksql function library is linked in.
+target_link_libraries(
+  velox_stateful_record_clock_refresh_test
+  velox_stateful_exec
+  velox_functions_flink
+  velox_vector_test_lib
+  velox_exec_test_lib
+  velox_exec
+  velox_common_base
+  GTest::gtest
+  GTest::gtest_main)
+
 add_executable(velox_stateful_sink_operator_test StatefulSinkOperatorTest.cpp)
 
 add_test(velox_stateful_sink_operator_test velox_stateful_sink_operator_test)
 
 target_link_libraries(
   velox_stateful_sink_operator_test
+  velox_stateful_exec
+  velox_vector_test_lib
+  velox_exec_test_lib
+  velox_exec
+  velox_common_base
+  GTest::gtest
+  GTest::gtest_main)
+
+add_executable(velox_stateful_state_key_test StateKeyTest.cpp)
+
+add_test(velox_stateful_state_key_test velox_stateful_state_key_test)
+
+target_link_libraries(
+  velox_stateful_state_key_test
+  velox_stateful_exec
+  velox_stateful_agg
+  velox_stateful_join
+  velox_stateful_rank
+  velox_stateful_state
+  velox_stateful_window
+  velox_stateful_udf
+  velox_vector_test_lib
+  velox_exec_test_lib
+  velox_exec
+  velox_common_base
+  GTest::gtest
+  GTest::gtest_main)
+
+add_executable(velox_stateful_key_selector_test KeySelectorTest.cpp)
+
+add_test(velox_stateful_key_selector_test velox_stateful_key_selector_test)
+
+target_link_libraries(
+  velox_stateful_key_selector_test
+  velox_stateful_exec
+  velox_stateful_agg
+  velox_stateful_join
+  velox_stateful_rank
+  velox_stateful_state
+  velox_stateful_window
+  velox_stateful_udf
+  velox_vector_test_lib
+  velox_exec_test_lib
+  velox_exec
+  velox_common_base
+  GTest::gtest
+  GTest::gtest_main)
+
+add_executable(velox_stateful_state_backend_test StateBackendTest.cpp)
+
+add_test(velox_stateful_state_backend_test velox_stateful_state_backend_test)
+
+target_link_libraries(
+  velox_stateful_state_backend_test
+  velox_stateful_exec
+  velox_stateful_agg
+  velox_stateful_join
+  velox_stateful_rank
+  velox_stateful_state
+  velox_stateful_window
+  velox_stateful_udf
+  velox_vector_test_lib
+  velox_exec_test_lib
+  velox_exec
+  velox_aggregates
+  velox_core
+  velox_common_base
+  GTest::gtest
+  GTest::gtest_main)
+
+add_executable(velox_stateful_checkpoint_format_test CheckpointFormatTest.cpp)
+
+add_test(velox_stateful_checkpoint_format_test
+         velox_stateful_checkpoint_format_test)
+
+target_link_libraries(
+  velox_stateful_checkpoint_format_test
+  velox_stateful_exec
+  velox_stateful_agg
+  velox_stateful_join
+  velox_stateful_rank
+  velox_stateful_state
+  velox_stateful_window
+  velox_stateful_udf
+  velox_vector_test_lib
+  velox_exec_test_lib
+  velox_exec
+  velox_common_base
+  GTest::gtest
+  GTest::gtest_main)
+
+add_executable(velox_stateful_operator_checkpoint_test
+               StatefulOperatorCheckpointTest.cpp)
+
+add_test(velox_stateful_operator_checkpoint_test
+         velox_stateful_operator_checkpoint_test)
+
+target_link_libraries(
+  velox_stateful_operator_checkpoint_test
   velox_stateful_exec
   velox_vector_test_lib
   velox_exec_test_lib

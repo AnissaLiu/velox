@@ -18,6 +18,7 @@
 #include "velox/exec/TableScan.h"
 #include "velox/experimental/stateful/StatefulTask.h"
 #include "velox/experimental/stateful/StreamElement.h"
+#include "velox/functions/flinksql/RecordClock.h"
 
 namespace facebook::velox::stateful {
 
@@ -132,6 +133,14 @@ void StatefulOperator::advance() {
 }
 
 void StatefulOperator::pushOutput(StreamElementPtr output) {
+  // Record-emission boundary and the single funnel for it: every record
+  // leaving an operator (source, window, timer and finish drains alike)
+  // passes here before the downstream evaluation is driven synchronously on
+  // the emitting thread. Flink evaluates the temporal functions
+  // (CURRENT_TIMESTAMP et al.) once per record as it reaches the operator;
+  // refreshing the per-thread record clock here makes every temporal
+  // occurrence evaluated for this record observe the same instant.
+  functions::flinksql::RecordClock::refresh();
   if (targets_.empty()) {
     auto task = std::static_pointer_cast<StatefulTask>(
         operator_->operatorCtx()->driverCtx()->task);
@@ -224,10 +233,6 @@ void StatefulOperator::checkWatermarkStatus(int64_t now) {
 }
 
 void StatefulOperator::initializeStateBackend(StateBackend* stateBackend) {
-  if (!stateHandler_) {
-    stateHandler_ = std::make_shared<StreamOperatorStateHandler>(
-        op()->operatorId(), stateBackend->createKeyedStateBackend());
-  }
   auto snapshotable = dynamic_cast<Snapshotable*>(op().get());
   if (snapshotable) {
     // TODO: Flink restore is a separated logic.
@@ -242,15 +247,18 @@ void StatefulOperator::initializeStateBackend(StateBackend* stateBackend) {
 
 std::vector<std::string> StatefulOperator::snapshotState(int64_t checkpointId) {
   std::vector<std::string> snapshots = operator_->snapshotState(checkpointId);
-  if (!stateHandler_) {
-    return snapshots;
-  }
-  stateHandler_->snapshotState(checkpointId);
-  auto snapshotable = dynamic_cast<Snapshotable*>(op().get());
-  if (snapshotable) {
-    // If the operator is checkpointable, we need to snapshot it.
-    snapshotable->snapshot(
-        checkpointId, 0, CheckpointOptions::defaultOptions());
+  // The legacy handler's leg runs only when the handler exists (it is not
+  // constructed since the operators own their typed backends); the walk
+  // itself - the wrapped operator's records above, the targets' below -
+  // must not depend on it.
+  if (stateHandler_) {
+    stateHandler_->snapshotState(checkpointId);
+    auto snapshotable = dynamic_cast<Snapshotable*>(op().get());
+    if (snapshotable) {
+      // If the operator is checkpointable, we need to snapshot it.
+      snapshotable->snapshot(
+          checkpointId, 0, CheckpointOptions::defaultOptions());
+    }
   }
   for (auto& target : targets_) {
     auto targetSnapshots = target->snapshotState(checkpointId);
@@ -270,17 +278,18 @@ void StatefulOperator::restoreState(
 
 std::vector<std::string> StatefulOperator::notifyCheckpointComplete(
     int64_t checkpointId) {
-  if (!stateHandler_) {
-    return {};
+  std::vector<std::string> committed;
+  // Same narrowing as snapshotState: the handler's leg is conditional,
+  // the commit and the targets' notifications below are not.
+  if (stateHandler_) {
+    stateHandler_->notifyCheckpointComplete(checkpointId);
+    auto checkpointListener = dynamic_cast<CheckpointListener*>(op().get());
+    if (checkpointListener) {
+      // If the operator is checkpointable, we need to snapshot it.
+      checkpointListener->notifyCheckpointComplete(checkpointId);
+    }
   }
-
-  stateHandler_->notifyCheckpointComplete(checkpointId);
-  auto checkpointListener = dynamic_cast<CheckpointListener*>(op().get());
-  if (checkpointListener) {
-    // If the operator is checkpointable, we need to snapshot it.
-    checkpointListener->notifyCheckpointComplete(checkpointId);
-  }
-  std::vector<std::string> committed = operator_->commit(checkpointId);
+  committed = operator_->commit(checkpointId);
   for (auto& target : targets_) {
     std::vector<std::string> otherCommitted =
         target->notifyCheckpointComplete(checkpointId);
@@ -291,14 +300,15 @@ std::vector<std::string> StatefulOperator::notifyCheckpointComplete(
 }
 
 void StatefulOperator::notifyCheckpointAborted(int64_t checkpointId) {
-  if (!stateHandler_) {
-    return;
-  }
-  stateHandler_->notifyCheckpointAborted(checkpointId);
-  auto checkpointListener = dynamic_cast<CheckpointListener*>(op().get());
-  if (checkpointListener) {
-    // If the operator is checkpointable, we need to snapshot it.
-    checkpointListener->notifyCheckpointAborted(checkpointId);
+  // Same narrowing as snapshotState: the handler's leg is conditional,
+  // the wrapped operator's abort and the targets' below are not.
+  if (stateHandler_) {
+    stateHandler_->notifyCheckpointAborted(checkpointId);
+    auto checkpointListener = dynamic_cast<CheckpointListener*>(op().get());
+    if (checkpointListener) {
+      // If the operator is checkpointable, we need to snapshot it.
+      checkpointListener->notifyCheckpointAborted(checkpointId);
+    }
   }
   operator_->abortCheckpoint(checkpointId);
   for (auto& target : targets_) {
