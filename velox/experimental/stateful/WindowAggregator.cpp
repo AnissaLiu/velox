@@ -140,8 +140,19 @@ void WindowAggregator::advance() {
 
   // Group rows by sliceEnd using the batch-level SliceAssigner.
   auto sliceEndToData = sliceAssigner_->assignSliceEnd(input_);
+  WindowType wt = static_cast<WindowType>(node_->windowType());
   for (const auto& [sliceEnd, sliceData] : sliceEndToData) {
-    SliceEndNs ns(sliceEnd);
+    // Determine the accumulation namespace: for HOP/CUMULATE, rows
+    // accumulate into the first slice's acc (Flink sliceStateMergeTarget:
+    // mergeTarget = firstSliceEnd = windowStart(sliceEnd) + step).
+    // For TUMBLE/SESSION, rows accumulate into the slice itself.
+    int64_t accumulateNs;
+    if (wt == WindowType::HOP || wt == WindowType::CUMULATIVE) {
+      accumulateNs = sliceAssigner_->getWindowStart(sliceEnd) + node_->step();
+    } else {
+      accumulateNs = sliceEnd;
+    }
+    SliceEndNs ns(accumulateNs);
 
     // Late check (event-time, two-phase per Flink AbstractSliceWindowAggProcessor):
     // Phase 1: slice fired? Phase 2: all owning windows fired?
@@ -215,7 +226,10 @@ void WindowAggregator::advance() {
           false /* mayPushdown */);
     }
 
-    // Register fire entries for each distinct key under this slice.
+    // Register fire entries for each distinct key under the SLICE end
+    // (not the accumulation namespace): fire is on the last slice end
+    // that triggers the window close (Flink timer @ windowEnd-1 where
+    // windowEnd = lastWindowEnd = sliceEnd for the final slice).
     for (vector_size_t d = 0; d < sliceNumDistinct; ++d) {
       registerFire(distinctKeys[d], sliceEnd);
     }
@@ -270,55 +284,64 @@ void WindowAggregator::fireDue(int64_t progress) {
 void WindowAggregator::fireWindow(
     const RowContainerStateKey& key,
     int64_t windowEnd) {
-  auto ns = SliceEndNs(windowEnd);
+  WindowType wt = static_cast<WindowType>(node_->windowType());
+
+  // For HOP/CUMULATE, the accumulated state lives in the first slice's
+  // namespace (accumulated during advance() via the merge-target redirect:
+  // all rows sharing a window accumulate into the first slice's acc).
+  // The fire timestamp is the last slice end (windowEnd); the result
+  // must be read from the first slice end (Flink mergeSlices semantics).
+  int64_t stateNs;
+  if (wt == WindowType::HOP || wt == WindowType::CUMULATIVE) {
+    stateNs = sliceAssigner_->getWindowStart(windowEnd) + node_->step();
+  } else {
+    stateNs = windowEnd;
+  }
+
+  auto ns = SliceEndNs(stateNs);
   char* row = state_->row(key, ns);
   if (row == nullptr) {
     return; // Window already cleared or never materialized.
   }
 
-  WindowType wt = static_cast<WindowType>(node_->windowType());
   if (wt == WindowType::HOP) {
-    // HOP: fire with heap-merge of covering slices, then
-    // first-slice-only clear + chain continuation (Flink
-    // SliceSharedWindowAggProcessor.fireWindow).
-    // 1. Heap-merge: read all slices covered by this window,
-    //    merge their accumulators into a single result.
-    //    (Stage 2: implement multi-slice merge.)
-    //    For now, use the current slice as-is (single-slice path).
+    // HOP: emit the window result from the first slice's acc.
     emitWindowResult(key, windowStart(windowEnd), windowEnd);
 
-    // 2. Expired slices (Flink SharedSliceAssigner.expiredSlices):
-    //    - windowEnd == firstSliceEnd: skip cleanup (shared first slice)
-    //    - windowEnd == lastSliceEnd: clear first + current
-    //    - otherwise: clear current only
+    // ExpiredSlices (Flink SharedSliceAssigner.expiredSlices):
+    // - windowEnd == firstSliceEnd: skip cleanup (shared first slice)
+    // - windowEnd == lastSliceEnd: clear first slice (contains all data)
+    // - middle: no cleanup (data is already in first slice)
     int64_t windowStartMs = windowStart(windowEnd);
     int64_t firstSliceEnd = windowStartMs + node_->step();
     int64_t lastSliceEnd = windowStartMs + node_->size();
-    if (windowEnd == firstSliceEnd) {
-      // First slice: shared, skip cleanup.
-    } else if (windowEnd == lastSliceEnd) {
-      // Last slice: cleanup first + current.
+    if (windowEnd == lastSliceEnd) {
       state_->remove(key, SliceEndNs(firstSliceEnd));
-      state_->remove(key, ns);
-    } else {
-      // Middle slice: cleanup current only.
-      state_->remove(key, ns);
     }
 
-    // 3. Chain continuation (Flink nextTriggerWindow):
-    //    next = windowEnd + step; max = windowStart + size;
-    //    next > max → stop chain. Check if next window's first covering
-    //    slice has state (replaces Flink's COUNT(*)==0 check).
+    // Chain continuation (Flink nextTriggerWindow):
+    // next = windowEnd + step; max = windowStart + size;
+    // next > max → stop. Check next window's first slice for state
+    // (design D6 replaces COUNT(*)==0 with state existence check).
     int64_t nextWindowEnd = windowEnd + node_->step();
     int64_t maxWindowEnd = windowStartMs + node_->size();
     if (nextWindowEnd <= maxWindowEnd) {
-      // Check if next window has any state (first covering slice).
       int64_t nextWindowStart = windowStart(nextWindowEnd);
       int64_t nextFirstSliceEnd = nextWindowStart + node_->step();
       if (state_->row(key, SliceEndNs(nextFirstSliceEnd)) != nullptr) {
         registerFire(key, nextWindowEnd);
       }
-      // If no state, stop chain (design D6: no state → no emission).
+      // No state → stop chain.
+    }
+  } else if (wt == WindowType::CUMULATIVE) {
+    // CUMULATE: emit cumulative value from the first slice. Clear only
+    // on the final step. TODO: implement step-by-step intermediate
+    // emission (currently over-emits intermediate steps without clearing).
+    emitWindowResult(key, windowStart(windowEnd), windowEnd);
+    int64_t windowStartMs = windowStart(windowEnd);
+    int64_t lastSliceEnd = windowStartMs + node_->size();
+    if (windowEnd >= lastSliceEnd) {
+      state_->remove(key, ns);
     }
   } else {
     // TUMBLE: fire and clear the entire (key, slice).
@@ -331,7 +354,18 @@ void WindowAggregator::emitWindowResult(
     const RowContainerStateKey& key,
     int64_t windowStartMs,
     int64_t windowEndMs) {
-  auto ns = SliceEndNs(windowEndMs);
+  // For HOP/CUMULATE, the state is in the first slice namespace
+  // (already computed by fireWindow). For TUMBLE, it's the slice itself.
+  // The caller (fireWindow) reads from the correct namespace before
+  // calling this; here we just re-read for extraction.
+  WindowType wt = static_cast<WindowType>(node_->windowType());
+  int64_t stateNs;
+  if (wt == WindowType::HOP || wt == WindowType::CUMULATIVE) {
+    stateNs = sliceAssigner_->getWindowStart(windowEndMs) + node_->step();
+  } else {
+    stateNs = windowEndMs;
+  }
+  auto ns = SliceEndNs(stateNs);
   char* row = state_->row(key, ns);
   VELOX_CHECK_NOT_NULL(row, "fire on a window without state");
 
