@@ -14,322 +14,360 @@
  * limitations under the License.
  */
 #include "velox/experimental/stateful/WindowAggregator.h"
-#include <experimental/stateful/InternalTimerService.h>
-#include <list>
-#include <memory>
-#include <mutex>
-#include "velox/experimental/stateful/TimerHeapInternalTimer.h"
+
+#include "velox/exec/AggregationMasks.h"
+#include "velox/experimental/stateful/RowKind.h"
+#include "velox/experimental/stateful/StreamElement.h"
+#include "velox/experimental/stateful/agg/AggregateInfos.h"
+#include "velox/exec/Aggregate.h"
 #include "velox/experimental/stateful/window/TimeWindowUtil.h"
-#include "velox/type/Type.h"
+#include "velox/type/Timestamp.h"
 #include "velox/vector/ComplexVector.h"
+#include "velox/vector/FlatVector.h"
 
 namespace facebook::velox::stateful {
 
 WindowAggregator::WindowAggregator(
     std::unique_ptr<exec::Operator> localAggregator,
-    std::unique_ptr<exec::Operator> globalAggregator,
-    std::vector<std::unique_ptr<StatefulOperator>> targets,
-    std::unique_ptr<KeySelector> keySelector,
-    std::unique_ptr<SliceAssigner> sliceAssigner,
-    const long windowInterval,
-    const bool useDayLightSaving,
-    const bool isEventTime,
-    const int windowStartIndex,
-    const int windowEndIndex)
-    : StatefulOperator(std::move(globalAggregator), std::move(targets)),
-      Triggerable<int64_t, long>(),
-      localAggregator_(std::move(localAggregator)),
-      keySelector_(std::move(keySelector)),
-      sliceAssigner_(std::move(sliceAssigner)),
-      windowInterval_(windowInterval),
-      useDayLightSaving_(useDayLightSaving),
-      isEventTime_(isEventTime),
-      windowStartIndex_(windowStartIndex),
-      windowEndIndex_(windowEndIndex) {
-  windowBuffer_ = std::make_shared<RecordsWindowBuffer>();
-}
+    std::vector<StatefulOperatorPtr> targets,
+    std::shared_ptr<const StreamWindowAggregationNode> node,
+    exec::DriverCtx* driverCtx)
+    : StatefulOperator(
+          std::make_unique<EmptyOperator>(0, driverCtx, node),
+          std::move(targets)),
+      node_(std::move(node)),
+      localAggregator_(std::move(localAggregator)) {}
 
 void WindowAggregator::initialize() {
-  StatefulOperator::initialize();
   if (localAggregator_) {
     localAggregator_->initialize();
   }
+  const auto* aggNode =
+      std::dynamic_pointer_cast<const core::AggregationNode>(
+          node_->aggregation())
+          .get();
+  VELOX_CHECK_NOT_NULL(
+      aggNode, "StreamWindowAggregationNode must carry an AggregationNode");
+  auto inputType = std::dynamic_pointer_cast<const RowType>(
+      aggNode->sources()[0]->outputType());
+  VELOX_CHECK_NOT_NULL(
+      inputType, "AggregationNode input type must be a RowType");
+  numKeys_ = static_cast<int32_t>(node_->keyedStateSpec()->keyChannels().size());
+  numLeadingColumns_ = numKeys_ + 2; // key columns + window_start + window_end
+  aggregates_ = makeAggregateInfos(
+      aggNode->aggregates(),
+      inputType,
+      node_->outputType(),
+      numLeadingColumns_,
+      op()->operatorCtx()->driverCtx()->queryConfig(),
+      memoryPool());
 }
 
-void WindowAggregator::initializeState() {
-  // TODO: migrate this operator to operator-owned keyed state (cf.
-  // GroupAggregator::initializeStateBackend) and remove this guard.
-  VELOX_NYI(
-      "WindowAggregator is not yet migrated to operator-owned keyed state; "
-      "there is no state handler to initialize");
-  StateDescriptor stateDesc("window-aggs", "", memoryPool());
-  windowState_ = stateHandler()->getValueState(stateDesc);
-  windowTimerService_ = stateHandler()->createTimerService(this);
+void WindowAggregator::initializeStateBackend(StateBackend* stateBackend) {
+  const auto& spec = *node_->keyedStateSpec();
+  keyedBackend_ = createKeyedStateBackend<RowContainerStateKey>(
+      *stateBackend, spec, memoryPool());
+  keySelector_ = std::make_unique<KeySelector>(
+      keyedBackend_->keyIndex(), spec.keyChannels());
+
+  sliceAssigner_ = std::make_unique<SliceAssigner>(
+      nullptr, /* keySelector unused for batch-level slice */
+      node_->size(),
+      node_->step(),
+      node_->offset(),
+      Window::getType(node_->windowType()),
+      node_->rowtimeIndex());
+
+  // Aggregate functions were created in initialize() (op() available from
+  // the EmptyOperator set in the constructor).
+
+
+  std::vector<exec::Accumulator> accumulators;
+  accumulators.reserve(aggregates_.size());
+  for (const auto& aggregate : aggregates_) {
+    accumulators.emplace_back(
+        aggregate.function.get(), aggregate.intermediateType);
+  }
+  AggregatingStateDescriptor descriptor(
+      "window-agg-accumulators",
+      std::move(accumulators),
+      [this](char** rows, size_t numRows) { initializeRows(rows, numRows); },
+      [this](char* row, const std::vector<VectorPtr>& columns) {
+        mergeRow(row, columns);
+      },
+      memoryPool());
+  state_ =
+      keyedBackend_->getOrCreateAggregatingState<SliceEndNs>(descriptor);
+
+  auto* valueRows = state_->valueRows();
+  for (size_t i = 0; i < aggregates_.size(); ++i) {
+    auto& function = aggregates_[i].function;
+    function->setAllocator(&valueRows->stringAllocator());
+    const auto rowColumn = valueRows->columnAt(static_cast<int32_t>(i));
+    function->setOffsets(
+        rowColumn.offset(),
+        rowColumn.nullByte(),
+        rowColumn.nullMask(),
+        rowColumn.initializedByte(),
+        rowColumn.initializedMask(),
+        valueRows->rowSizeOffset());
+  }
+
+  StatefulOperator::initializeStateBackend(stateBackend);
 }
 
 void WindowAggregator::addInput(StreamElementPtr input) {
-  VELOX_CHECK(!input_, "Last input has not been processed");
   auto record = std::static_pointer_cast<StreamRecord>(input);
-  // TODO: preserve rowKind across this operator.
+  checkInputRowKinds(*record);
+  VELOX_CHECK(!input_, "Last input has not been processed");
   input_ = record->record();
 }
 
 void WindowAggregator::advance() {
   if (!input_) {
+    if (keyedBackend_) {
+      keyedBackend_->advance();
+    }
     return;
   }
 
-  std::map<int64_t, RowVectorPtr> keyToData = keySelector_->partition(input_);
-  for (const auto& [key, data] : keyToData) {
-    std::map<int64_t, RowVectorPtr> sliceEndToData =
-        sliceAssigner_->assignSliceEnd(data);
-    for (const auto& [sliceEnd, data] : sliceEndToData) {
-      auto windowData = data;
-      if (!isEventTime_) {
-        windowTimerService_->registerProcessingTimeTimer(
-            key, sliceEnd, sliceEnd);
-      }
-      if (isEventTime_ &&
-          TimeWindowUtil::isWindowFired(
-              sliceEnd, currentProgress_, shiftTimeZone_)) {
-        // the assigned slice has been triggered, which means current element is
-        // late, but maybe not need to drop
-        int64_t lastWindowEnd = sliceAssigner_->getLastWindowEnd(sliceEnd);
-        if (TimeWindowUtil::isWindowFired(
-                lastWindowEnd, currentProgress_, shiftTimeZone_)) {
-          // the last window has been triggered, so the element can be dropped
-          // now
-          // TODO: record dropped counter.
-          continue;
+  const auto numRows = input_->size();
+  if (numRows == 0) {
+    input_.reset();
+    keyedBackend_->advance();
+    return;
+  }
+
+  // Group rows by sliceEnd using the batch-level SliceAssigner.
+  auto sliceEndToData = sliceAssigner_->assignSliceEnd(input_);
+  for (const auto& [sliceEnd, sliceData] : sliceEndToData) {
+    SliceEndNs ns(sliceEnd);
+
+    // Late check (event-time): skip if all owning windows fired.
+    if (node_->isEventTime() &&
+        TimeWindowUtil::isWindowFired(sliceEnd, currentProgress_, 0)) {
+      continue; // TODO: late-drop counter.
+    }
+
+    // Probe keys for this slice's data.
+    keySelector_->probe(sliceData);
+    const auto distinctKeys = keySelector_->distinctKeys();
+    const auto sliceNumDistinct =
+        static_cast<vector_size_t>(distinctKeys.size());
+    const auto sliceNumRows = sliceData->size();
+
+    // Batch state rows for the distinct keys under this namespace.
+    stateRows_.resize(sliceNumDistinct);
+    state_->rows(
+        folly::Range<const RowContainerStateKey*>(
+            distinctKeys.data(),
+            static_cast<size_t>(sliceNumDistinct)),
+        ns,
+        stateRows_.data());
+
+    // Accumulate raw input (same pattern as GroupAggregator::accumulateInput).
+    const SelectivityVector allRows(sliceNumRows);
+    std::vector<std::optional<column_index_t>> maskChannels;
+    maskChannels.reserve(aggregates_.size());
+    for (const auto& aggregate : aggregates_) {
+      maskChannels.push_back(aggregate.mask);
+    }
+    exec::AggregationMasks masks(std::move(maskChannels));
+    masks.addInput(sliceData, allRows);
+
+    // Map each row to its distinct key index, then to its state row.
+    rowToDistinct_.clear();
+    for (vector_size_t d = 0; d < sliceNumDistinct; ++d) {
+      rowToDistinct_[distinctKeys[d].row()] = d;
+    }
+    rowGroups_.resize(sliceNumRows);
+    const auto perRowKeys = keySelector_->keys();
+    for (vector_size_t row = 0; row < sliceNumRows; ++row) {
+      rowGroups_[row] = stateRows_[rowToDistinct_[perRowKeys[row].row()]];
+    }
+
+    for (size_t i = 0; i < aggregates_.size(); ++i) {
+      auto& aggregate = aggregates_[i];
+      std::vector<VectorPtr> args;
+      args.reserve(aggregate.inputs.size());
+      for (size_t j = 0; j < aggregate.inputs.size(); ++j) {
+        if (aggregate.constantInputs[j] != nullptr) {
+          args.push_back(aggregate.constantInputs[j]);
         } else {
-          // TODO: addElement may have data output.
-          windowBuffer_->addElement(
-              key, sliceStateMergeTarget(sliceEnd), windowData);
-          int64_t unfiredFirstWindow = sliceEnd;
-          while (TimeWindowUtil::isWindowFired(
-              unfiredFirstWindow, currentProgress_, shiftTimeZone_)) {
-            unfiredFirstWindow += windowInterval_;
-          }
-          windowTimerService_->registerEventTimeTimer(
-              key, unfiredFirstWindow, unfiredFirstWindow - 1);
+          args.push_back(sliceData->childAt(aggregate.inputs[j]));
         }
-      } else {
-        // the assigned slice hasn't been triggered, accumulate into the
-        // assigned slice
-        std::lock_guard<std::mutex> lock(*mtx_);
-        windowBuffer_->addElement(key, sliceEnd, windowData);
       }
+      const auto* activeRows = masks.activeRows(i);
+      aggregate.function->addRawInput(
+          rowGroups_.data(),
+          activeRows != nullptr ? *activeRows : allRows,
+          args,
+          false /* mayPushdown */);
+    }
+
+    // Register fire entries for each distinct key under this slice.
+    for (vector_size_t d = 0; d < sliceNumDistinct; ++d) {
+      registerFire(distinctKeys[d], sliceEnd);
     }
   }
+
   input_.reset();
+  keyedBackend_->advance();
 }
 
-void WindowAggregator::processWatermarkInternal(int64_t timestamp) {
-  if (isEventTime_ && timestamp > currentProgress_) {
+void WindowAggregator::processWatermark(int64_t timestamp) {
+  if (timestamp > currentProgress_) {
+    fireDue(timestamp);
     currentProgress_ = timestamp;
-    if (currentProgress_ >= nextTriggerWatermark_) {
-      // we only need to call advanceProgress() when current watermark may
-      // trigger window
-      auto windowKeyToData = windowBuffer_->advanceProgress(currentProgress_);
-      for (const auto& [windowKey, datas] : windowKeyToData) {
-        if (datas.empty()) {
-          continue;
-        }
-        // TODO: agg should output no matter how many rows in data.
-        VELOX_CHECK(localAggregator_, "Local aggregator not set");
-        localAggregator_->addInput(
-            TimeWindowUtil::mergeVectors(datas, op()->pool()));
-        RowVectorPtr localAcc = localAggregator_->getOutput();
-        auto stateAcc =
-            windowState_->value(windowKey.key(), windowKey.window());
-        std::list<RowVectorPtr> allDatas;
-        if (!localAcc && !stateAcc) {
-          continue;
-        } else {
-          if (localAcc) {
-            allDatas.push_back(localAcc);
-          }
-          if (stateAcc) {
-            allDatas.push_back(stateAcc);
-          }
-          op()->addInput(TimeWindowUtil::mergeVectors(allDatas, op()->pool()));
-          auto newAcc = op()->getOutput();
-          if (newAcc) {
-            windowState_->update(windowKey.key(), windowKey.window(), newAcc);
-          }
-        }
-      }
-      windowTimerService_->advanceWatermark(currentProgress_);
-      nextTriggerWatermark_ = TimeWindowUtil::getNextTriggerWatermark(
-          currentProgress_,
-          windowInterval_,
-          shiftTimeZone_,
-          useDayLightSaving_);
-    }
   }
-}
-
-void WindowAggregator::onEventTime(
-    std::shared_ptr<TimerHeapInternalTimer<int64_t, int64_t>> timer) {
-  onTimer(timer);
-}
-
-int64_t WindowAggregator::sliceStateMergeTarget(int64_t sliceToMerge) {
-  // TODO: implement it
-  return sliceToMerge;
-}
-
-/// Add window_start / window_end timestamp to output
-RowVectorPtr addWindowTimestampToOutput(
-    const RowVectorPtr& output,
-    const std::string& fieldName,
-    const int64_t fieldValue,
-    const int32_t fieldIndex) {
-  auto createTimestampVector =
-      [&](const Timestamp& val,
-          const size_t size,
-          velox::memory::MemoryPool* pool) -> VectorPtr {
-    const TypePtr windowStartType = std::make_shared<const TimestampType>();
-    VectorPtr windowStartVec =
-        BaseVector::create(windowStartType, output->size(), output->pool());
-    FlatVector<Timestamp>* timestampVector =
-        windowStartVec->asFlatVector<Timestamp>();
-    for (size_t i = 0; i < size; ++i) {
-      timestampVector->set(i, val);
-    }
-    return windowStartVec;
-  };
-  const TypePtr& outputType = output->type();
-  const RowTypePtr& outputRowType =
-      std::dynamic_pointer_cast<const RowType>(outputType);
-  const std::vector<std::string>& outputFieldNames = outputRowType->names();
-  const std::vector<TypePtr>& outputFieldTypes = outputRowType->children();
-  const std::vector<VectorPtr>& outputFields = output->children();
-  std::vector<std::string> newOutputFieldNames;
-  std::vector<TypePtr> newOutputFieldTypes;
-  std::vector<VectorPtr> newOutputFields;
-  VectorPtr windowStartVec = createTimestampVector(
-      Timestamp::fromMillis(fieldValue), output->size(), output->pool());
-  for (int i = 0; i < fieldIndex; ++i) {
-    newOutputFieldTypes.emplace_back(outputFieldTypes[i]);
-    newOutputFieldNames.emplace_back(outputFieldNames[i]);
-    newOutputFields.emplace_back(outputFields[i]);
-  }
-  newOutputFieldTypes.emplace_back(std::make_shared<const TimestampType>());
-  newOutputFieldNames.emplace_back(fieldName);
-  newOutputFields.emplace_back(windowStartVec);
-  for (int i = fieldIndex + 1; i < output->childrenSize() + 1; ++i) {
-    newOutputFieldTypes.emplace_back(outputFieldTypes[i - 1]);
-    newOutputFieldNames.emplace_back(outputFieldNames[i - 1]);
-    newOutputFields.emplace_back(outputFields[i - 1]);
-  }
-  auto newOutputRowType = std::make_shared<const RowType>(
-      std::move(newOutputFieldNames), std::move(newOutputFieldTypes));
-  return std::make_shared<RowVector>(
-      output->pool(),
-      newOutputRowType,
-      output->nulls(),
-      output->size(),
-      newOutputFields,
-      output->getNullCount());
-}
-
-void WindowAggregator::onTimer(
-    std::shared_ptr<TimerHeapInternalTimer<int64_t, int64_t>> timer) {
-  fireWindow(timer->key(), timer->timestamp(), timer->ns());
-  clearWindow(timer->key(), timer->timestamp(), timer->ns());
-}
-
-template <typename K>
-void WindowAggregator::fireWindow(
-    const K& key,
-    int64_t timerTimestamp,
-    int64_t windowEnd) {
-  RowVectorPtr output = windowState_->value(key, windowEnd);
-  if (!output) {
-    LOG(INFO) << "No output found for key: " << key
-              << ", window end: " << windowEnd;
-    return;
-  } else {
-    if (windowStartIndex_ >= 0) {
-      output = addWindowTimestampToOutput(
-          output,
-          "window_start",
-          windowEnd - windowInterval_,
-          windowStartIndex_);
-    }
-    if (windowEndIndex_ >= 0) {
-      output = addWindowTimestampToOutput(
-          output, "window_end", windowEnd, windowEndIndex_);
-    }
-  }
-  if (output) {
-    pushOutput(
-        std::make_shared<StreamRecord>(getPlanNodeId(), std::move(output)));
-  }
-}
-
-template <typename K>
-void WindowAggregator::clearWindow(
-    const K& key,
-    int64_t timerTimestamp,
-    int64_t windowEnd) {
-  windowState_->remove(key, windowEnd);
-}
-
-void WindowAggregator::onProcessingTime(
-    std::shared_ptr<TimerHeapInternalTimer<int64_t, int64_t>> timer) {
-  if (timer->timestamp() > lastTriggeredProcessingTime_) {
-    lastTriggeredProcessingTime_ = timer->timestamp();
-    auto windowKeyToData = windowBuffer_->advanceProgress(timer->timestamp());
-    for (auto& [windowKey, datas] : windowKeyToData) {
-      if (datas.empty()) {
-        continue;
-      }
-      auto stateAcc = windowState_->value(windowKey.key(), windowKey.window());
-      if (stateAcc) {
-        datas.push_back(stateAcc);
-      }
-      RowVectorPtr opInput = TimeWindowUtil::mergeVectors(datas, op()->pool());
-      op()->addInput(opInput);
-      auto newAcc = op()->getOutput();
-      if (newAcc) {
-        windowState_->update(windowKey.key(), windowKey.window(), newAcc);
-      }
-    }
-    if (!windowKeyToData.empty()) {
-      windowBuffer_->clear();
-    }
-  }
-  onTimer(timer);
+  // Propagate watermark downstream (after fire, matching Flink order).
+  StatefulOperator::processWatermark(timestamp);
 }
 
 void WindowAggregator::onProcessingTime(int64_t timestamp) {
-  auto callbackBridge = nativeCallbackBridge();
-  VELOX_CHECK_NOT_NULL(
-      callbackBridge,
-      "Native callback bridge is not bound for processing-time callback");
-  callbackBridge->onProcessingTime(timestamp);
+  if (timestamp > lastTriggeredProcessingTime_) {
+    fireDue(timestamp);
+    lastTriggeredProcessingTime_ = timestamp;
+  }
 }
 
 void WindowAggregator::close() {
-  // processWatermarkInternal(std::numeric_limits<int64_t>::max());
+  // Flush trailing windows (bounded input).
+  fireDue(std::numeric_limits<int64_t>::max());
   StatefulOperator::close();
   if (localAggregator_) {
     localAggregator_->close();
   }
   input_.reset();
-  // State members are created in initializeState(), which fails fast when the
-  // operator has no state handler; they can be null at close time.
-  if (windowTimerService_) {
-    windowTimerService_->close();
-  }
-  windowBuffer_->clear();
-  if (windowState_) {
-    windowState_->clear();
-  }
+  state_.reset();
+  keyedBackend_.reset();
+  keySelector_.reset();
+  fireIndex_.clear();
   currentProgress_ = 0;
-  nextTriggerWatermark_ = 0;
+  lastTriggeredProcessingTime_ = 0;
+}
+
+void WindowAggregator::fireDue(int64_t progress) {
+  while (!fireIndex_.empty() && fireIndex_.begin()->first <= progress) {
+    auto it = fireIndex_.begin();
+    auto key = it->second.key;
+    auto windowEnd = it->second.ns.sliceEnd();
+    fireIndex_.erase(it);
+    fireWindow(key, windowEnd);
+  }
+}
+
+void WindowAggregator::fireWindow(
+    const RowContainerStateKey& key,
+    int64_t windowEnd) {
+  auto ns = SliceEndNs(windowEnd);
+  char* row = state_->row(key, ns);
+  if (row == nullptr) {
+    return; // Window already cleared or never materialized.
+  }
+  emitWindowResult(key, windowStart(windowEnd), windowEnd);
+  // Stage 1 (TUMBLE): clear the entire (key, slice) after fire.
+  // TODO stage 2: HOP — merge covering slices, clear first slice, chain.
+  // TODO stage 2: CUMULATE — emit cumulative value per step, clear on final step.
+  state_->remove(key, ns);
+}
+
+void WindowAggregator::emitWindowResult(
+    const RowContainerStateKey& key,
+    int64_t windowStartMs,
+    int64_t windowEndMs) {
+  auto ns = SliceEndNs(windowEndMs);
+  char* row = state_->row(key, ns);
+  VELOX_CHECK_NOT_NULL(row, "fire on a window without state");
+
+  const auto& outputType = node_->outputType();
+  const auto numOutputCols = static_cast<int32_t>(outputType->size());
+  std::vector<VectorPtr> children(numOutputCols);
+
+  auto* keyRows = keySelector_->keyRowContainer();
+
+  // Key columns extracted from the key row.
+  const folly::Range<const vector_size_t*> oneRow(
+      &kZeroIndex, 1);
+  const char* keyRowPtr = key.row();
+  for (int32_t k = 0; k < numKeys_; ++k) {
+    children[k] = BaseVector::create(outputType->childAt(k), 1, memoryPool());
+    keyRows->extractColumn(
+        &keyRowPtr, oneRow, k, 0, children[k]);
+  }
+
+  // Window columns as TIMESTAMP.
+  auto startVec = BaseVector::create(outputType->childAt(numKeys_), 1, memoryPool());
+  if (auto* tsVec = startVec->asFlatVector<Timestamp>()) {
+    tsVec->set(0, Timestamp::fromMillis(windowStartMs));
+  }
+  children[numKeys_] = startVec;
+
+  auto endVec = BaseVector::create(outputType->childAt(numKeys_ + 1), 1, memoryPool());
+  if (auto* tsVec = endVec->asFlatVector<Timestamp>()) {
+    tsVec->set(0, Timestamp::fromMillis(windowEndMs));
+  }
+  children[numKeys_ + 1] = endVec;
+
+  // Extract final aggregate values from the accumulator row.
+  for (size_t i = 0; i < aggregates_.size(); ++i) {
+    auto result = BaseVector::create(
+        outputType->childAt(numLeadingColumns_ + i), 1, memoryPool());
+    aggregates_[i].function->extractValues(&row, 1, &result);
+    children[numLeadingColumns_ + i] = result;
+  }
+
+  auto output = std::make_shared<RowVector>(
+      memoryPool(), outputType, nullptr, 1, std::move(children));
+  pushOutput(std::make_shared<StreamRecord>(
+      getPlanNodeId(), std::move(output)));
+}
+
+int64_t WindowAggregator::windowStart(int64_t windowEnd) const {
+  return windowEnd - node_->size();
+}
+
+void WindowAggregator::registerFire(
+    const RowContainerStateKey& key,
+    int64_t windowEnd) {
+  // Due timestamp = window_end - 1 (matching Flink's maxTimestamp).
+  fireIndex_.emplace(windowEnd - 1, FireEntry{key, SliceEndNs(windowEnd)});
+}
+
+void WindowAggregator::initializeRows(char** rows, size_t numRows) {
+  std::vector<vector_size_t> indices(numRows);
+  for (size_t i = 0; i < numRows; ++i) {
+    indices[i] = static_cast<vector_size_t>(i);
+  }
+  for (auto& aggregate : aggregates_) {
+    aggregate.function->initializeNewGroups(
+        rows,
+        folly::Range<const vector_size_t*>(indices.data(), indices.size()));
+  }
+}
+
+void WindowAggregator::mergeRow(
+    char* row,
+    const std::vector<VectorPtr>& columns) {
+  for (size_t i = 0; i < aggregates_.size(); ++i) {
+    aggregates_[i].function->addSingleGroupIntermediateResults(
+        row, SelectivityVector(1), {columns[i]}, false);
+  }
+}
+
+void WindowAggregator::checkInputRowKinds(const StreamRecord& record) const {
+  if (record.appendOnly()) {
+    return;
+  }
+  const auto& rowKind = *record.rowKind();
+  // TODO: support retraction semantics (L2); every row must be INSERT until then.
+  for (vector_size_t row = 0; row < rowKind.size(); ++row) {
+    VELOX_CHECK_EQ(
+        rowKind.valueAt(row),
+        static_cast<int8_t>(RowKind::INSERT),
+        "WindowAggregator received a non-INSERT row; retraction is not "
+        "supported yet (L2)");
+  }
 }
 
 } // namespace facebook::velox::stateful

@@ -357,17 +357,12 @@ StatefulOperatorPtr StatefulPlanner::transformStreamWindowAggregationOperator(
     auto localAggregator = windowAggNode->isEventTime()
         ? transformOperator(windowAggNode->localAgg())
         : nullptr;
-    return std::make_unique<WindowAggregator>(
+    auto windowAggregator = std::make_unique<WindowAggregator>(
         windowAggNode->isEventTime() ? std::move(localAggregator) : nullptr,
-        std::move(op),
         std::move(targets),
-        std::move(keySelector),
-        std::move(sliceAssigner),
-        windowAggNode->windowInterval(),
-        windowAggNode->useDayLightSaving(),
-        windowAggNode->isEventTime(),
-        windowAggNode->windowStartIndex(),
-        windowAggNode->windowEndIndex());
+        windowAggNode,
+        ctx_);
+    return windowAggregator;
   }
 }
 

@@ -14,42 +14,62 @@
  * limitations under the License.
  */
 #pragma once
-#include <cstdint>
 
+#include <cstdint>
+#include <map>
 #include <memory>
-#include "velox/exec/Driver.h"
+#include <string>
+#include <unordered_map>
+#include <utility>
+#include <vector>
+
+#include "velox/exec/AggregateInfo.h"
 #include "velox/exec/Operator.h"
-#include "velox/experimental/stateful/InternalTimerService.h"
+#include "velox/experimental/stateful/EmptyOperator.h"
 #include "velox/experimental/stateful/KeySelector.h"
 #include "velox/experimental/stateful/StatefulOperator.h"
+#include "velox/experimental/stateful/StatefulPlanNode.h"
 #include "velox/experimental/stateful/StreamElement.h"
-#include "velox/experimental/stateful/TimerHeapInternalTimer.h"
-#include "velox/experimental/stateful/Triggerable.h"
+#include "velox/experimental/stateful/state/HeapKeyedStateBackend.h"
+#include "velox/experimental/stateful/state/Namespace.h"
+#include "velox/experimental/stateful/state/State.h"
 #include "velox/experimental/stateful/window/SliceAssigner.h"
-#include "velox/experimental/stateful/window/WindowBuffer.h"
+#include "velox/experimental/stateful/window/WindowNamespace.h"
 
 namespace facebook::velox::stateful {
 
-/// This class is related to XXXWindowAggProcessor in Flink.
-/// Its work includes both WindowAggOperator and XXXWindowAggOperator.
-class WindowAggregator : public StatefulOperator,
-                         public Triggerable<int64_t, int64_t> {
+/// Streaming window TVF aggregation (TUMBLE / HOP / CUMULATE / SESSION)
+/// over the keyed state backend, the counterpart of Flink's
+/// WindowAggOperator + XXXWindowAggProcessor family.
+///
+/// State model: AggregatingState<K, Ns> where K is the grouping key row
+/// and Ns is the window namespace (SliceEndNs for aligned windows,
+/// TimeWindowNs for SESSION). Window results are emitted when the
+/// watermark (event-time) or the processing-time clock crosses
+/// window_end - 1ms; fire is driven by a fire index (an ordered map from
+/// due timestamp to dirty (key, window) pairs) rather than per-(key, ns)
+/// timers. Output is append-only (+I); empty windows are not emitted
+/// (state exists only for windows that received data). Late elements are
+/// dropped only when every window owning the slice has already fired;
+/// otherwise they are accumulated into an unfired window.
+///
+/// Limitations (fail loud): append-only input only (needRetraction=true
+/// is rejected at translation time; a non-+I rowKind fails at runtime);
+/// DISTINCT/sorted aggregates are rejected by makeAggregateInfos.
+class WindowAggregator : public StatefulOperator {
  public:
   WindowAggregator(
       std::unique_ptr<exec::Operator> localAggregator,
-      std::unique_ptr<exec::Operator> globalAggregator,
-      std::vector<std::unique_ptr<StatefulOperator>> targets,
-      std::unique_ptr<KeySelector> keySelector,
-      std::unique_ptr<SliceAssigner> sliceAssigner,
-      const int64_t windowInterval,
-      const bool useDayLightSaving,
-      const bool isEventTime,
-      const int32_t windowStartIndex,
-      const int32_t windowEndIndex);
+      std::vector<StatefulOperatorPtr> targets,
+      std::shared_ptr<const StreamWindowAggregationNode> node,
+      exec::DriverCtx* driverCtx);
 
   void initialize() override;
 
-  void initializeState() override;
+  /// Builds the keyed state backend from the plan's KeyedStateSpec,
+  /// binds the key selector, creates the AggregatingState with the
+  /// window namespace, and wires the aggregate function offsets.
+  void initializeStateBackend(StateBackend* stateBackend) override;
 
   void addInput(StreamElementPtr input) override;
 
@@ -61,48 +81,101 @@ class WindowAggregator : public StatefulOperator,
     return "WindowAggregator";
   }
 
-  void processWatermark(int64_t timestamp) override {
-    // processWatermarkInternal(timestamp);
+  /// Fires all windows whose dueTs <= watermark, then propagates the
+  /// watermark downstream. Fire precedes propagation (Flink semantics).
+  void processWatermark(int64_t timestamp) override;
+
+  /// Processing-time trigger: fires all windows whose dueTs <= timestamp,
+  /// deduplicated by lastTriggeredProcessingTime_. Called from the
+  /// NativeCallbackBridge proc-time callback path.
+  void onProcessingTime(int64_t timestamp);
+
+  HeapKeyedStateBackend<RowContainerStateKey>& keyedStateBackend() {
+    return *keyedBackend_;
   }
 
-  void onEventTime(
-      std::shared_ptr<TimerHeapInternalTimer<int64_t, int64_t>> timer) override;
-
-  void onProcessingTime(
-      std::shared_ptr<TimerHeapInternalTimer<int64_t, int64_t>> timer) override;
-
-  void onProcessingTime(int64_t timestamp) override;
-
  private:
-  void processWatermarkInternal(int64_t timestamp);
+  /// A dirty (key, window) pair pending fire. The key is a copy (row
+  /// pointer + cached hash + keyGroup), re-probed at fire time: the
+  /// KeyTable reclaims zero-reference key rows at batch boundaries, and
+  /// a fire entry registered in batch N may be consumed in batch N+M.
+  /// Invariant: a fire entry (key, W) exists -> W's state entry exists
+  /// -> the key row has not been reclaimed.
+  struct FireEntry {
+    RowContainerStateKey key;
+    SliceEndNs ns;
+  };
 
-  int64_t sliceStateMergeTarget(int64_t sliceToMerge);
+  /// Fires all fire-index entries with dueTs <= progress, per window type.
+  void fireDue(int64_t progress);
 
-  void onTimer(std::shared_ptr<TimerHeapInternalTimer<int64_t, int64_t>> timer);
+  /// Fires one (key, windowEnd): reads the accumulator, emits the
+  /// result row (+I), then clears per window type.
+  void fireWindow(const RowContainerStateKey& key, int64_t windowEnd);
 
-  template <typename K>
-  void fireWindow(const K& key, int64_t timerTimestamp, int64_t windowEnd);
+  /// Emits the result row: [key columns, window_start, window_end, agg values].
+  void emitWindowResult(
+      const RowContainerStateKey& key,
+      int64_t windowStart,
+      int64_t windowEnd);
 
-  template <typename K>
-  void clearWindow(const K& key, int64_t timerTimestamp, int64_t windowEnd);
+  /// Per-window-type cleanup after fire.
+  void clearWindow(const RowContainerStateKey& key, int64_t windowEnd);
 
+  /// Late-data check: true if every window owning this slice has fired.
+  bool isLate(int64_t sliceEnd);
+
+  /// The interval used to advance from one window to the next in the
+  /// unfired-window scan (late-data path). HOP -> step, CUMULATE -> step,
+  /// TUMBLE/SESSION -> size.
+  int64_t windowStep() const;
+
+  /// The interval used to compute the next trigger watermark from a
+  /// current watermark: same as windowStep().
+  int64_t nextTriggerInterval() const;
+
+  /// Window start from window end (all window types: end - size).
+  int64_t windowStart(int64_t windowEnd) const;
+
+  /// Adds a (key, windowEnd) pair to the fire index at dueTs = windowEnd - 1.
+  void registerFire(
+      const RowContainerStateKey& key,
+      int64_t windowEnd);
+
+  /// Aggregate metadata resolution from the plan's AggregationNode.
+  std::vector<exec::AggregateInfo> makeWindowAggregateInfos();
+
+  /// Batch accumulator initialization for freshly materialized state rows.
+  void initializeRows(char** rows, size_t numRows);
+
+  /// Merges intermediate columns into a state row (restore path).
+  void mergeRow(char* row, const std::vector<VectorPtr>& columns);
+
+  /// Asserts the input record carries only +I rowKinds.
+  void checkInputRowKinds(const StreamRecord& record) const;
+
+  const std::shared_ptr<const StreamWindowAggregationNode> node_;
   std::unique_ptr<exec::Operator> localAggregator_;
+  std::vector<exec::AggregateInfo> aggregates_;
+  std::unique_ptr<HeapKeyedStateBackend<RowContainerStateKey>> keyedBackend_;
   std::unique_ptr<KeySelector> keySelector_;
   std::unique_ptr<SliceAssigner> sliceAssigner_;
-  WindowBufferPtr windowBuffer_;
-  const int64_t windowInterval_;
-  const bool useDayLightSaving_;
-  const int shiftTimeZone_ = 0; // TODO: support time zone shift
-  const bool isEventTime_ = true;
-  const int32_t windowStartIndex_ = -1;
-  const int32_t windowEndIndex_ = -1;
+  std::shared_ptr<AggregatingState<RowContainerStateKey, SliceEndNs>> state_;
 
-  RowVectorPtr input_;
+  /// Fire index: ordered map from due timestamp to dirty (key, window)
+  /// pairs. begin()->first is the next trigger watermark.
+  std::multimap<int64_t, FireEntry> fireIndex_;
+
   int64_t currentProgress_ = 0;
-  int64_t nextTriggerWatermark_ = 0;
   int64_t lastTriggeredProcessingTime_ = 0;
-  std::shared_ptr<ValueState<int64_t, int64_t, RowVectorPtr>> windowState_;
-  std::shared_ptr<InternalTimerService<int64_t, int64_t>> windowTimerService_;
+  int32_t numKeys_ = 0;
+  int32_t numLeadingColumns_ = 0;
+  RowVectorPtr input_;
+  std::vector<char*> stateRows_;
+  std::vector<char*> rowGroups_;
+  std::unordered_map<const char*, vector_size_t> rowToDistinct_;
+
+  static constexpr vector_size_t kZeroIndex = 0;
 };
 
 } // namespace facebook::velox::stateful

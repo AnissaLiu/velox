@@ -306,6 +306,8 @@ folly::dynamic StreamWindowAggregationNode::serialize() const {
   obj["localAgg"] = localAgg_ ? localAgg_->serialize() : nullptr;
   obj["keySelectorSpec"] = keySelectorSpec_->serialize();
   obj["sliceAssignerSpec"] = sliceAssignerSpec_->serialize();
+  obj["keyedStateSpec"] = keyedStateSpec_->serialize();
+  obj["shiftTimeZone"] = shiftTimeZone_;
   obj["windowInterval"] = windowInterval_;
   obj["useDayLightSaving"] = useDayLightSaving_;
   obj["isLocalAgg"] = isLocalAgg_;
@@ -349,14 +351,23 @@ core::PlanNodePtr StreamWindowAggregationNode::create(
     localAgg = ISerializable::deserialize<core::AggregationNode>(
         obj["localAgg"], context);
   }
+  std::shared_ptr<const KeyedStateSpec> keyedStateSpec;
+  if (obj.count("keyedStateSpec") && !obj["keyedStateSpec"].isNull()) {
+    keyedStateSpec = ISerializable::deserialize<KeyedStateSpec>(
+        obj["keyedStateSpec"], context);
+  }
+  std::string shiftTimeZone;
+  if (obj.count("shiftTimeZone") && !obj["shiftTimeZone"].isNull()) {
+    shiftTimeZone = obj["shiftTimeZone"].asString();
+  }
   return std::make_shared<const StreamWindowAggregationNode>(
       planNodeId,
       aggregation,
       localAgg,
       keySelectorSpec,
       sliceAssignerSpec,
-      obj["windowInterval"].asInt(),
-      obj["useDayLightSaving"].asBool(),
+      keyedStateSpec,
+      shiftTimeZone,
       obj["isLocalAgg"].asBool(),
       obj["size"].asInt(),
       obj["step"].asInt(),

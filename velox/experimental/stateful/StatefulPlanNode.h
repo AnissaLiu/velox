@@ -448,8 +448,8 @@ class StreamWindowAggregationNode : public core::PlanNode {
       const std::shared_ptr<const core::PartitionFunctionSpec>& keySelectorSpec,
       const std::shared_ptr<const core::PartitionFunctionSpec>&
           sliceAssignerSpec,
-      int64_t windowInterval,
-      bool useDayLightSaving,
+      const std::shared_ptr<const KeyedStateSpec>& keyedStateSpec,
+      std::string shiftTimeZone,
       bool isLocalAgg,
       int64_t size,
       int64_t step,
@@ -465,8 +465,8 @@ class StreamWindowAggregationNode : public core::PlanNode {
         localAgg_(std::move(localAgg)),
         keySelectorSpec_(std::move(keySelectorSpec)),
         sliceAssignerSpec_(std::move(sliceAssignerSpec)),
-        windowInterval_(windowInterval),
-        useDayLightSaving_(useDayLightSaving),
+        keyedStateSpec_(std::move(keyedStateSpec)),
+        shiftTimeZone_(std::move(shiftTimeZone)),
         isLocalAgg_(isLocalAgg),
         size_(size),
         step_(step),
@@ -500,6 +500,20 @@ class StreamWindowAggregationNode : public core::PlanNode {
     return sliceAssignerSpec_;
   }
 
+  /// The keyed state configuration (the grouping key channels and their
+  /// types) the window aggregator builds its keyed state backend from.
+  const std::shared_ptr<const KeyedStateSpec>& keyedStateSpec() const {
+    return keyedStateSpec_;
+  }
+
+  /// IANA timezone name (e.g. "Asia/Shanghai") for window boundary math
+  /// and DST-corrected timer timestamps. Empty means UTC.
+  const std::string& shiftTimeZone() const {
+    return shiftTimeZone_;
+  }
+
+  // Retained for LocalWindowAggregator compat; superseded by
+  // shiftTimeZone_ for the global WindowAggregator.
   int64_t windowInterval() const {
     return windowInterval_;
   }
@@ -561,8 +575,10 @@ class StreamWindowAggregationNode : public core::PlanNode {
   const std::shared_ptr<const core::AggregationNode> localAgg_;
   const std::shared_ptr<const core::PartitionFunctionSpec> keySelectorSpec_;
   const std::shared_ptr<const core::PartitionFunctionSpec> sliceAssignerSpec_;
-  int64_t windowInterval_ = 0;
-  bool useDayLightSaving_ = false;
+  const std::shared_ptr<const KeyedStateSpec> keyedStateSpec_;
+  const std::string shiftTimeZone_;
+  int64_t windowInterval_ = 0; // Retained for C++ serialize compat; not consumed by the operator.
+  bool useDayLightSaving_ = false; // Retained for C++ serialize compat; superseded by shiftTimeZone_.
   bool isLocalAgg_;
   int64_t size_;
   int64_t step_;
