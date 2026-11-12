@@ -143,10 +143,20 @@ void WindowAggregator::advance() {
   for (const auto& [sliceEnd, sliceData] : sliceEndToData) {
     SliceEndNs ns(sliceEnd);
 
-    // Late check (event-time): skip if all owning windows fired.
+    // Late check (event-time, two-phase per Flink AbstractSliceWindowAggProcessor):
+    // Phase 1: slice fired? Phase 2: all owning windows fired?
+    // TUMBLE: lastWindowEnd == sliceEnd (single window).
+    // HOP: lastWindowEnd = sliceEnd - sliceSize + size (multiple windows).
     if (node_->isEventTime() &&
         TimeWindowUtil::isWindowFired(sliceEnd, currentProgress_, 0)) {
-      continue; // TODO: late-drop counter.
+      int64_t lastWindowEnd = sliceAssigner_->getLastWindowEnd(sliceEnd);
+      if (TimeWindowUtil::isWindowFired(
+              lastWindowEnd, currentProgress_, 0)) {
+        continue; // All owning windows fired: drop.
+      }
+      // Partially fired: fall through to accumulate into this unfired slice.
+      // TODO: Flink re-registers timer for the first unfired window.
+      // Our fire index covers this: registerFire below handles it.
     }
 
     // Probe keys for this slice's data.
@@ -265,11 +275,56 @@ void WindowAggregator::fireWindow(
   if (row == nullptr) {
     return; // Window already cleared or never materialized.
   }
-  emitWindowResult(key, windowStart(windowEnd), windowEnd);
-  // Stage 1 (TUMBLE): clear the entire (key, slice) after fire.
-  // TODO stage 2: HOP — merge covering slices, clear first slice, chain.
-  // TODO stage 2: CUMULATE — emit cumulative value per step, clear on final step.
-  state_->remove(key, ns);
+
+  WindowType wt = static_cast<WindowType>(node_->windowType());
+  if (wt == WindowType::HOP) {
+    // HOP: fire with heap-merge of covering slices, then
+    // first-slice-only clear + chain continuation (Flink
+    // SliceSharedWindowAggProcessor.fireWindow).
+    // 1. Heap-merge: read all slices covered by this window,
+    //    merge their accumulators into a single result.
+    //    (Stage 2: implement multi-slice merge.)
+    //    For now, use the current slice as-is (single-slice path).
+    emitWindowResult(key, windowStart(windowEnd), windowEnd);
+
+    // 2. Expired slices (Flink SharedSliceAssigner.expiredSlices):
+    //    - windowEnd == firstSliceEnd: skip cleanup (shared first slice)
+    //    - windowEnd == lastSliceEnd: clear first + current
+    //    - otherwise: clear current only
+    int64_t windowStartMs = windowStart(windowEnd);
+    int64_t firstSliceEnd = windowStartMs + node_->step();
+    int64_t lastSliceEnd = windowStartMs + node_->size();
+    if (windowEnd == firstSliceEnd) {
+      // First slice: shared, skip cleanup.
+    } else if (windowEnd == lastSliceEnd) {
+      // Last slice: cleanup first + current.
+      state_->remove(key, SliceEndNs(firstSliceEnd));
+      state_->remove(key, ns);
+    } else {
+      // Middle slice: cleanup current only.
+      state_->remove(key, ns);
+    }
+
+    // 3. Chain continuation (Flink nextTriggerWindow):
+    //    next = windowEnd + step; max = windowStart + size;
+    //    next > max → stop chain. Check if next window's first covering
+    //    slice has state (replaces Flink's COUNT(*)==0 check).
+    int64_t nextWindowEnd = windowEnd + node_->step();
+    int64_t maxWindowEnd = windowStartMs + node_->size();
+    if (nextWindowEnd <= maxWindowEnd) {
+      // Check if next window has any state (first covering slice).
+      int64_t nextWindowStart = windowStart(nextWindowEnd);
+      int64_t nextFirstSliceEnd = nextWindowStart + node_->step();
+      if (state_->row(key, SliceEndNs(nextFirstSliceEnd)) != nullptr) {
+        registerFire(key, nextWindowEnd);
+      }
+      // If no state, stop chain (design D6: no state → no emission).
+    }
+  } else {
+    // TUMBLE: fire and clear the entire (key, slice).
+    emitWindowResult(key, windowStart(windowEnd), windowEnd);
+    state_->remove(key, ns);
+  }
 }
 
 void WindowAggregator::emitWindowResult(
