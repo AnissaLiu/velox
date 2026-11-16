@@ -95,12 +95,15 @@ void WindowAggregator::initialize() {
       keyChannels[0] == inputType->size() - 1 &&
       std::string(inputType->nameOf(inputType->size() - 1)) == "$keyless_key";
   numKeys_ = static_cast<int32_t>(keyChannels.size());
+  // The keyless wrap adds the key column to the input type only - the
+  // output projection carries no key column at all.
+  outputKeyCount_ = keyless_ ? 0 : numKeys_;
   // Window columns carry windowStartIndex/windowEndIndex; -1 falls back
   // to the legacy layout right after the key columns.
   windowStartIdx_ =
-      node_->windowStartIndex() >= 0 ? node_->windowStartIndex() : numKeys_;
+      node_->windowStartIndex() >= 0 ? node_->windowStartIndex() : outputKeyCount_;
   windowEndIdx_ =
-      node_->windowEndIndex() >= 0 ? node_->windowEndIndex() : numKeys_ + 1;
+      node_->windowEndIndex() >= 0 ? node_->windowEndIndex() : outputKeyCount_ + 1;
   // The aggregate output columns sit where the plan's projection puts
   // them - either right after the keys (q12-style: key, aggs, window) or
   // after the window columns (wa-e1-style: key, window, aggs). The base
@@ -108,13 +111,13 @@ void WindowAggregator::initialize() {
   // column; the run must be contiguous and cover every remaining column.
   const auto& outputType = node_->outputType();
   std::vector<bool> taken(outputType->size(), false);
-  for (int32_t k = 0; k < numKeys_; ++k) {
+  for (int32_t k = 0; k < outputKeyCount_; ++k) {
     taken[k] = true;
   }
   taken[windowStartIdx_] = true;
   taken[windowEndIdx_] = true;
   const int32_t freeColumns =
-      static_cast<int32_t>(outputType->size()) - numKeys_ - 2;
+      static_cast<int32_t>(outputType->size()) - outputKeyCount_ - 2;
   VELOX_CHECK_EQ(
       freeColumns,
       static_cast<int32_t>(aggNode->aggregates().size()),
@@ -541,11 +544,12 @@ void WindowAggregator::emitWindowResult(
 
   auto* keyRows = keySelector_->keyRowContainer();
 
-  // Key columns extracted from the key row.
+  // Key columns extracted from the key row (none for keyless - the
+  // output projection carries no key column).
   const folly::Range<const vector_size_t*> oneRow(
       &kZeroIndex, 1);
   const char* keyRowPtr = key.row();
-  for (int32_t k = 0; k < numKeys_; ++k) {
+  for (int32_t k = 0; k < outputKeyCount_; ++k) {
     children[k] = BaseVector::create(outputType->childAt(k), 1, memoryPool());
     keyRows->extractColumn(
         &keyRowPtr, oneRow, k, 0, children[k]);

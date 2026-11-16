@@ -221,6 +221,9 @@ class WindowAggregator : public StatefulOperator {
   /// on in addInput.
   bool keyless_ = false;
   RowTypePtr declaredInputType_;
+  /// The key column count in the OUTPUT projection - zero for keyless
+  /// (the wrap column exists in the input type only).
+  int32_t outputKeyCount_ = 0;
 
   /// Output positions of window_start/window_end in the projection,
   /// resolved from windowStartIndex/windowEndIndex at initialize (-1 in

@@ -714,10 +714,13 @@ TEST_F(WindowAggregatorTest, testKeylessGlobalWindowAggregation) {
       declaredInput,
       /*isEventTime=*/true,
       /*rowtimeIndex=*/1,
-      ROW({"kk", "w_start", "w_end", "s"},
-          {BIGINT(), TIMESTAMP(), TIMESTAMP(), BIGINT()}),
+      ROW({"w_start", "w_end", "s"},
+          {TIMESTAMP(), TIMESTAMP(), BIGINT()}),
       /*keyChannels=*/{3},
-      /*keyTypes=*/{BIGINT()});
+      /*keyTypes=*/{BIGINT()},
+      /*shiftTimeZone=*/"",
+      /*windowStartIndex=*/0,
+      /*windowEndIndex=*/1);
   auto aggregator = makeAggregator(node, std::move(capture));
 
   // Runtime rows carry only k/ts/c; the k column value is irrelevant to
@@ -726,10 +729,18 @@ TEST_F(WindowAggregatorTest, testKeylessGlobalWindowAggregation) {
   aggregator->advance();
   aggregator->processWatermark(5000);
 
+  // The output projection carries NO key column - window columns at 0/1,
+  // the aggregate at 2 (the gluten keyless layout).
   ASSERT_EQ(capturePtr->records().size(), 1);
   auto out = capturePtr->records()[0];
-  EXPECT_EQ(out->childAt(0)->asFlatVector<int64_t>()->valueAt(0), 0);
-  EXPECT_EQ(out->childAt(3)->asFlatVector<int64_t>()->valueAt(0), 40);
+  ASSERT_EQ(out->size(), 1);
+  EXPECT_EQ(
+      out->childAt(0)->asFlatVector<Timestamp>()->valueAt(0),
+      Timestamp::fromMillis(0));
+  EXPECT_EQ(
+      out->childAt(1)->asFlatVector<Timestamp>()->valueAt(0),
+      Timestamp::fromMillis(5000));
+  EXPECT_EQ(out->childAt(2)->asFlatVector<int64_t>()->valueAt(0), 40);
 }
 
 // A FILTERED COUNT(*) is NOT a count star (Flink indexOfCountStar
