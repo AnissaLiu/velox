@@ -16,8 +16,11 @@
 #pragma once
 
 #include <cstdint>
+#include <limits>
 #include <map>
 #include <memory>
+#include <optional>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -27,6 +30,7 @@
 #include "velox/exec/Operator.h"
 #include "velox/experimental/stateful/EmptyOperator.h"
 #include "velox/experimental/stateful/KeySelector.h"
+#include "velox/experimental/stateful/ProcessingTimeScheduler.h"
 #include "velox/experimental/stateful/StatefulOperator.h"
 #include "velox/experimental/stateful/StatefulPlanNode.h"
 #include "velox/experimental/stateful/StreamElement.h"
@@ -53,9 +57,12 @@ namespace facebook::velox::stateful {
 /// dropped only when every window owning the slice has already fired;
 /// otherwise they are accumulated into an unfired window.
 ///
-/// Limitations (fail loud): append-only input only (needRetraction=true
-/// is rejected at translation time; a non-+I rowKind fails at runtime);
-/// DISTINCT/sorted aggregates are rejected by makeAggregateInfos.
+/// Limitations (fail loud): append-only input only (a non-+I rowKind
+/// fails at runtime, L2; gluten rejects needRetraction at translation
+/// time); DISTINCT/sorted aggregates are rejected by makeAggregateInfos
+/// (L1); CUMULATE/SESSION windows are rejected at operator init (L5,
+/// TODO: separate follow-up task) — they must not silently run the
+/// TUMBLE logic.
 class WindowAggregator : public StatefulOperator {
  public:
   WindowAggregator(
@@ -90,6 +97,24 @@ class WindowAggregator : public StatefulOperator {
   /// NativeCallbackBridge proc-time callback path.
   void onProcessingTime(int64_t timestamp);
 
+  /// Processing-time tick on the task thread: StatefulTask::next invokes
+  /// checkWatermarkStatus(now) on idle drains, which is where proc-time
+  /// windows actually fire (the background wake-up timer only asks Java
+  /// to drain the task; all firing happens on the task thread).
+  void checkWatermarkStatus(int64_t now) override;
+
+  /// Rows dropped by the two-phase late check (every owning window fired).
+  uint64_t lateDroppedRows() const {
+    return lateDroppedRows_;
+  }
+
+  /// Rebuilds the fire index from the live state entries after a backend
+  /// restore (the index is not persisted): one fire entry per (key,
+  /// window). The production checkpoint wiring (L3) calls this once the
+  /// restore finishes; tests call it directly after
+  /// keyedStateBackend().restore(bytes).
+  void rebuildFireIndex();
+
   HeapKeyedStateBackend<RowContainerStateKey>& keyedStateBackend() {
     return *keyedBackend_;
   }
@@ -109,41 +134,52 @@ class WindowAggregator : public StatefulOperator {
   /// Fires all fire-index entries with dueTs <= progress, per window type.
   void fireDue(int64_t progress);
 
-  /// Fires one (key, windowEnd): reads the accumulator, emits the
-  /// result row (+I), then clears per window type.
+  /// Fires one (key, windowEnd) of an unshared window (TUMBLE): reads the
+  /// accumulator read-only, emits the result row (+I), clears the slice.
   void fireWindow(const RowContainerStateKey& key, int64_t windowEnd);
 
-  /// Emits the result row: [key columns, window_start, window_end, agg values].
+  /// Fires one HOP window: heap-merges the covered slices' accumulators
+  /// into the first slice, emits, clears the first slice only, and chains
+  /// the next window (Flink SharedSliceAssigner#mergeSlices/expiredSlices/
+  /// nextTriggerWindow).
+  void fireHopWindow(const RowContainerStateKey& key, int64_t windowEnd);
+
+  /// Merges one source accumulator row into a target accumulator row via
+  /// the intermediate (extractAccumulators -> addSingleGroupIntermediate
+  /// Results) path; the source row is left untouched.
+  void mergeAccumulatorRows(char* targetRow, char* sourceRow);
+
+  /// Emits the result row: [key columns, window_start, window_end, agg
+  /// values] extracted from 'row'.
   void emitWindowResult(
       const RowContainerStateKey& key,
       int64_t windowStart,
-      int64_t windowEnd);
-
-  /// Per-window-type cleanup after fire.
-  void clearWindow(const RowContainerStateKey& key, int64_t windowEnd);
-
-  /// Late-data check: true if every window owning this slice has fired.
-  bool isLate(int64_t sliceEnd);
-
-  /// The interval used to advance from one window to the next in the
-  /// unfired-window scan (late-data path). HOP -> step, CUMULATE -> step,
-  /// TUMBLE/SESSION -> size.
-  int64_t windowStep() const;
-
-  /// The interval used to compute the next trigger watermark from a
-  /// current watermark: same as windowStep().
-  int64_t nextTriggerInterval() const;
+      int64_t windowEnd,
+      char* row);
 
   /// Window start from window end (all window types: end - size).
   int64_t windowStart(int64_t windowEnd) const;
 
-  /// Adds a (key, windowEnd) pair to the fire index at dueTs = windowEnd - 1.
+  /// Adds a (key, windowEnd) pair to the fire index at dueTs = windowEnd
+  /// - 1, deduplicated per (key row, windowEnd): Flink registers each
+  /// (key, namespace) timer once; a duplicate registration would fire an
+  /// already-cleared window and emit an empty result row.
   void registerFire(
       const RowContainerStateKey& key,
       int64_t windowEnd);
 
-  /// Aggregate metadata resolution from the plan's AggregationNode.
-  std::vector<exec::AggregateInfo> makeWindowAggregateInfos();
+  /// Processing-time mode only: (re-)arms the one-shot background wake-up
+  /// timer at the fire-index head so the Java mailbox drains the task and
+  /// checkWatermarkStatus fires due windows on time even without input.
+  void armProcTimeWakeUp();
+
+  /// Shuts the proc-time wake-up scheduler down (close path).
+  void shutdownProcTimeScheduler();
+
+  /// Keyless mode: appends the "$keyless_key" constant BIGINT column the
+  /// declared input type carries (gluten adds it for empty grouping) to
+  /// a runtime batch, which is one column narrower.
+  RowVectorPtr wrapKeylessColumn(const RowVectorPtr& input);
 
   /// Batch accumulator initialization for freshly materialized state rows.
   void initializeRows(char** rows, size_t numRows);
@@ -166,8 +202,43 @@ class WindowAggregator : public StatefulOperator {
   /// pairs. begin()->first is the next trigger watermark.
   std::multimap<int64_t, FireEntry> fireIndex_;
 
-  int64_t currentProgress_ = 0;
+  /// Deduplication set for the fire index, keyed by (key row, windowEnd).
+  /// Entries are inserted in registerFire() and erased when the
+  /// corresponding multimap entry is popped in fireDue().
+  std::set<std::pair<const char*, int64_t>> registeredFires_;
+
+  /// Processing-time wake-up: a background one-shot timer at the fire
+  /// index head that asks Java (via NativeCallbackBridge::onProcessingTime)
+  /// to drain the task; the actual fire runs on the task thread in
+  /// checkWatermarkStatus. Only created for processing-time windows.
+  std::unique_ptr<ProcessingTimeScheduler> procTimeScheduler_;
+  std::optional<std::string> procTimerName_;
+  int64_t armedDueTs_ = std::numeric_limits<int64_t>::max();
+
+  /// Keyless mode (empty grouping): gluten appends a constant BIGINT
+  /// "$keyless_key" column to the declared input type and keys on it; the
+  /// runtime batches are one column narrower and get the column wrapped
+  /// on in addInput.
+  bool keyless_ = false;
+  RowTypePtr declaredInputType_;
+
+  /// Output positions of window_start/window_end in the projection,
+  /// resolved from windowStartIndex/windowEndIndex at initialize (-1 in
+  /// the plan falls back to right after the key columns).
+  int32_t windowStartIdx_ = 0;
+  int32_t windowEndIdx_ = 1;
+
+  /// The shift time zone resolved once from the plan node (nullptr =
+  /// UTC): drives input-side window alignment, late checks and the
+  /// DST-corrected fire due times.
+  const tzdb::time_zone* tz_ = nullptr;
+
+  /// Event-time progress starts at Long.MIN_VALUE (Flink currentProgress):
+  /// the first watermark, including 0 or a negative one, triggers due
+  /// windows and advances the progress.
+  int64_t currentProgress_ = std::numeric_limits<int64_t>::min();
   int64_t lastTriggeredProcessingTime_ = 0;
+  uint64_t lateDroppedRows_ = 0;
   int32_t numKeys_ = 0;
   int32_t numLeadingColumns_ = 0;
   RowVectorPtr input_;
@@ -175,7 +246,28 @@ class WindowAggregator : public StatefulOperator {
   std::vector<char*> rowGroups_;
   std::unordered_map<const char*, vector_size_t> rowToDistinct_;
 
+  /// The zero-argument COUNT call in the aggregate list (Flink's
+  /// "count star"), used for empty-window suppression: a window whose
+  /// count star reads 0 emits nothing (Flink WindowIsEmptySupplier).
+  /// -1 when the query carries no count star; hopping windows require
+  /// one (Flink checkArgument in WindowIsEmptySupplier).
+  int32_t countStarIndex_ = -1;
+  /// Accumulator-row offset of the count star column (set during the
+  /// setOffsets wiring); the count accumulator is a never-null inline
+  /// int64 (SimpleNumericAggregate<bool, int64_t, int64_t>), so a raw
+  /// read at this offset is the live count.
+  int32_t countStarOffset_ = -1;
+
   static constexpr vector_size_t kZeroIndex = 0;
 };
+
+/// Count-star helpers implemented in WindowAggregatorCountStar.cpp.
+/// Kept out of the WindowAggregator translation unit so the cold
+/// detection/check code does not perturb the hot-path codegen there.
+int32_t findCountStarIndex(
+    const std::vector<core::AggregationNode::Aggregate>& aggregates,
+    bool requireCountStar);
+bool countStarIsZero(const char* row, int32_t countStarOffset);
+int32_t countStarColumnOffset(TypeKind intermediateKind, int32_t offset);
 
 } // namespace facebook::velox::stateful
