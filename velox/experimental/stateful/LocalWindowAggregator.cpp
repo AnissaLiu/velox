@@ -26,14 +26,10 @@ LocalWindowAggregator::LocalWindowAggregator(
     std::vector<std::unique_ptr<StatefulOperator>> targets,
     std::unique_ptr<KeySelector> keySelector,
     std::unique_ptr<SliceAssigner> sliceAssigner,
-    const int64_t windowInterval,
-    const bool useDayLightSaving,
     RowTypePtr outputType)
     : StatefulOperator(std::move(op), std::move(targets)),
       keySelector_(std::move(keySelector)),
       sliceAssigner_(std::move(sliceAssigner)),
-      windowInterval_(windowInterval),
-      useDayLightSaving_(useDayLightSaving),
       outputType_(std::move(outputType)) {
   windowBuffer_ = std::make_shared<RecordsWindowBuffer>();
 }
@@ -84,9 +80,12 @@ void LocalWindowAggregator::processWatermarkInternal(int64_t timestamp) {
       }
       nextTriggerWatermark_ = TimeWindowUtil::getNextTriggerWatermark(
           currentWatermark_,
-          windowInterval_,
+          // The trigger interval is derived from the slice size (the old
+          // windowInterval plan field carried gcd(size, slide), which the
+          // assigner already computes per window type).
+          sliceAssigner_->getSliceEndInterval(),
           shiftTimeZone_,
-          useDayLightSaving_);
+          /*useDayLightSaving=*/false);
     }
   }
 }

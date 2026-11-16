@@ -512,16 +512,6 @@ class StreamWindowAggregationNode : public core::PlanNode {
     return shiftTimeZone_;
   }
 
-  // Retained for LocalWindowAggregator compat; superseded by
-  // shiftTimeZone_ for the global WindowAggregator.
-  int64_t windowInterval() const {
-    return windowInterval_;
-  }
-
-  bool useDayLightSaving() const {
-    return useDayLightSaving_;
-  }
-
   bool isLocalAgg() const {
     return isLocalAgg_;
   }
@@ -577,8 +567,6 @@ class StreamWindowAggregationNode : public core::PlanNode {
   const std::shared_ptr<const core::PartitionFunctionSpec> sliceAssignerSpec_;
   const std::shared_ptr<const KeyedStateSpec> keyedStateSpec_;
   const std::string shiftTimeZone_;
-  int64_t windowInterval_ = 0; // Retained for C++ serialize compat; not consumed by the operator.
-  bool useDayLightSaving_ = false; // Retained for C++ serialize compat; superseded by shiftTimeZone_.
   bool isLocalAgg_;
   int64_t size_;
   int64_t step_;

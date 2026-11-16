@@ -308,8 +308,6 @@ folly::dynamic StreamWindowAggregationNode::serialize() const {
   obj["sliceAssignerSpec"] = sliceAssignerSpec_->serialize();
   obj["keyedStateSpec"] = keyedStateSpec_->serialize();
   obj["shiftTimeZone"] = shiftTimeZone_;
-  obj["windowInterval"] = windowInterval_;
-  obj["useDayLightSaving"] = useDayLightSaving_;
   obj["isLocalAgg"] = isLocalAgg_;
   obj["size"] = size_;
   obj["step"] = step_;

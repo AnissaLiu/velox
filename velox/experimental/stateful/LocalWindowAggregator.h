@@ -33,8 +33,6 @@ class LocalWindowAggregator : public StatefulOperator {
       std::vector<std::unique_ptr<StatefulOperator>> targets,
       std::unique_ptr<KeySelector> keySelector,
       std::unique_ptr<SliceAssigner> sliceAssigner,
-      const int64_t windowInterval,
-      const bool useDayLightSaving,
       RowTypePtr outputType);
 
   void addInput(StreamElementPtr input) override;
@@ -58,8 +56,6 @@ class LocalWindowAggregator : public StatefulOperator {
   std::unique_ptr<KeySelector> keySelector_;
   std::unique_ptr<SliceAssigner> sliceAssigner_;
   WindowBufferPtr windowBuffer_;
-  const int64_t windowInterval_;
-  const bool useDayLightSaving_;
   const int shiftTimeZone_ = 0; // TODO: support time zone shift
   RowTypePtr outputType_;
 

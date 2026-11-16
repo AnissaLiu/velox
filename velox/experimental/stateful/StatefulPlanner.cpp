@@ -48,6 +48,7 @@
 #include "velox/experimental/stateful/SchemaWithRowKindNode.h"
 #include "velox/experimental/stateful/StatefulCalcOperator.h"
 #include "velox/experimental/stateful/StatefulPlanNode.h"
+#include "velox/experimental/stateful/window/TimeWindowUtil.h"
 #include "velox/experimental/stateful/StatefulSinkOperator.h"
 #include "velox/experimental/stateful/StatefulSourceOperator.h"
 #include "velox/experimental/stateful/StreamJoin.h"
@@ -343,15 +344,14 @@ StatefulOperatorPtr StatefulPlanner::transformStreamWindowAggregationOperator(
           windowAggNode->step(),
           windowAggNode->offset(),
           Window::getType(windowAggNode->windowType()),
-          windowAggNode->rowtimeIndex());
+          windowAggNode->rowtimeIndex(),
+          TimeWindowUtil::locateTimeZone(windowAggNode->shiftTimeZone()));
   if (windowAggNode->isLocalAgg()) {
     return std::make_unique<LocalWindowAggregator>(
         std::move(op),
         std::move(targets),
         std::move(keySelector),
         std::move(sliceAssigner),
-        windowAggNode->windowInterval(),
-        windowAggNode->useDayLightSaving(),
         windowAggNode->outputType());
   } else {
     auto localAggregator = windowAggNode->isEventTime()
