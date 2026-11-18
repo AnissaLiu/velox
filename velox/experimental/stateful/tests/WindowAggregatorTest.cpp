@@ -832,6 +832,49 @@ TEST_F(WindowAggregatorTest, testProcTimeTumbleFiresOnTick) {
   aggregator->close();
 }
 
+// SESSION processing-time: every batch shares the arrival instant, so
+// two batches land in one merged session window that fires on the
+// task-thread tick past the gap (audit N4 gap - the proc-time branch
+// of advanceSession had no dedicated test).
+TEST_F(WindowAggregatorTest, testProcTimeSessionMergesAndFires) {
+  auto capture =
+      std::make_unique<CaptureTarget>(driverCtx_.get(), nextNodeId());
+  auto* capturePtr = capture.get();
+  auto aggregator = makeAggregator(
+      makeNode(
+          {countStarOfC(), sumOfC()},
+          /*size=gap=*/60000,
+          0,
+          kSession,
+          ROW({"k", "ts", "c"}, {BIGINT(), TIMESTAMP(), BIGINT()}),
+          /*isEventTime=*/false,
+          /*rowtimeIndex=*/-1),
+      std::move(capture));
+
+  aggregator->addInput(windowRecord({1}, {0}, {10}));
+  aggregator->advance();
+  aggregator->addInput(windowRecord({1}, {0}, {20}));
+  aggregator->advance();
+  EXPECT_TRUE(capturePtr->records().empty());
+
+  // A tick far past the gap fires the single merged session.
+  aggregator->checkWatermarkStatus(
+      TimeWindowUtil::getCurrentProcessingTime() + 120000);
+  ASSERT_EQ(capturePtr->records().size(), 1);
+  auto out = capturePtr->records()[0];
+  EXPECT_EQ(
+      out->childAt(3)->asFlatVector<int64_t>()->valueAt(0), 2);
+  EXPECT_EQ(
+      out->childAt(4)->asFlatVector<int64_t>()->valueAt(0), 30);
+  const auto wStart = out->childAt(1)->asFlatVector<Timestamp>()->valueAt(0).toMillis();
+  const auto wEnd = out->childAt(2)->asFlatVector<Timestamp>()->valueAt(0).toMillis();
+  EXPECT_GE(wEnd - wStart, 60000);
+  EXPECT_LT(wEnd - wStart, 61000)
+      << "the two batch instants are microseconds apart; the cover is the gap plus that";
+
+  aggregator->close();
+}
+
 // Keyless windows: the runtime batch is one column narrower than the
 // declared input type (gluten appends "$keyless_key"); the wrap
 // materializes the constant key and all rows share one key row.
