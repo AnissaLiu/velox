@@ -353,8 +353,12 @@ StatefulOperatorPtr StatefulPlanner::transformStreamWindowAggregationOperator(
         windowAggNode,
         ctx_);
   } else {
+    // The two-stage global node carries no localAgg (it IS the global
+    // side); the single-stage event-time node carries one from the
+    // legacy local-pre-aggregation design. transformOperator would
+    // dereference a null PlanNodePtr.
     auto windowAggregator = std::make_unique<WindowAggregator>(
-        windowAggNode->isEventTime()
+        windowAggNode->isEventTime() && windowAggNode->localAgg()
             ? transformOperator(windowAggNode->localAgg())
             : nullptr,
         std::move(targets),
