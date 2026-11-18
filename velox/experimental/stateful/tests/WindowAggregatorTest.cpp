@@ -14,6 +14,9 @@
  * limitations under the License.
  */
 
+#include "velox/experimental/stateful/LocalWindowAggregator.h"
+#include "velox/exec/HashPartitionFunction.h"
+#include "velox/experimental/stateful/window/WindowPartitionFunction.h"
 #include "velox/experimental/stateful/WindowAggregator.h"
 
 #include <folly/init/Init.h>
@@ -278,6 +281,85 @@ class WindowAggregatorTest : public exec::test::OperatorTestBase {
         rowtimeIndex,
         windowStartIndex,
         windowEndIndex);
+  }
+
+  // The local pre-aggregation node: kPartial aggregation over the raw
+  // input, output = [key, intermediate, windowEnd] (the trailing
+  // windowEnd is the two-stage local contract).
+  std::shared_ptr<const StreamWindowAggregationNode> makeLocalNode(
+      const std::vector<core::AggregationNode::Aggregate>& aggregates,
+      const RowTypePtr& partialRowType,
+      int64_t size,
+      int64_t step,
+      int windowType) {
+    const auto id = nextNodeId();
+    std::vector<core::FieldAccessTypedExprPtr> groupingKeys;
+    groupingKeys.push_back(std::make_shared<core::FieldAccessTypedExpr>(
+        BIGINT(), "k"));
+    std::vector<std::string> aggNames;
+    for (size_t i = 0; i < aggregates.size(); ++i) {
+      aggNames.push_back("a" + std::to_string(i));
+    }
+    auto aggregation = std::make_shared<const core::AggregationNode>(
+        core::PlanNodeId{id + "-agg"},
+        core::AggregationNode::Step::kPartial,
+        groupingKeys,
+        std::vector<core::FieldAccessTypedExprPtr>{},
+        aggNames,
+        aggregates,
+        false,
+        std::make_shared<stateful::EmptyNode>(
+            ROW({"k", "ts", "c"}, {BIGINT(), TIMESTAMP(), BIGINT()})));
+    auto keyedStateSpec =
+        std::make_shared<KeyedStateSpec>(
+            std::vector<column_index_t>{0}, std::vector<TypePtr>{BIGINT()});
+    std::shared_ptr<const core::AggregationNode> noLocalAgg;
+    return std::make_shared<const StreamWindowAggregationNode>(
+        core::PlanNodeId{id},
+        aggregation,
+        noLocalAgg,
+        std::make_shared<exec::HashPartitionFunctionSpec>(
+            ROW({"k", "ts", "c"}, {BIGINT(), TIMESTAMP(), BIGINT()}),
+            std::vector<column_index_t>{0}),
+        std::make_shared<stateful::StreamWindowPartitionFunctionSpec>(
+            ROW({"k", "ts", "c"}, {BIGINT(), TIMESTAMP(), BIGINT()}),
+            1,
+            size,
+            step,
+            0,
+            static_cast<WindowType>(windowType)),
+        keyedStateSpec,
+        /*shiftTimeZone=*/"",
+        /*isLocalAgg=*/true,
+        size,
+        step,
+        /*offset=*/0,
+        windowType,
+        partialRowType,
+        /*isEventTime=*/true,
+        /*rowtimeIndex=*/1,
+        /*windowStartIndex=*/-1,
+        /*windowEndIndex=*/-1);
+  }
+
+  std::unique_ptr<LocalWindowAggregator> makeLocalAggregator(
+      const std::shared_ptr<const StreamWindowAggregationNode>& node,
+      std::unique_ptr<StatefulOperator> capture) {
+    std::vector<StatefulOperatorPtr> targets;
+    targets.push_back(std::move(capture));
+    auto sliceAssigner = std::make_unique<SliceAssigner>(
+        std::make_unique<KeySelector>(
+            node->sliceAssignerSpec()->create(INT_MAX, true),
+            pool()),
+        node->size(),
+        node->step(),
+        node->offset(),
+        Window::getType(node->windowType()),
+        node->rowtimeIndex());
+    auto aggregator = std::make_unique<LocalWindowAggregator>(
+        std::move(targets), std::move(sliceAssigner), node, driverCtx_.get());
+    aggregator->initialize();
+    return aggregator;
   }
 
   std::unique_ptr<WindowAggregator> makeAggregator(
@@ -952,6 +1034,113 @@ TEST_F(WindowAggregatorTest, testProcTimeSessionMergesAndFires) {
   EXPECT_GE(wEnd - wStart, 60000);
   EXPECT_LT(wEnd - wStart, 61000)
       << "the two batch instants are microseconds apart; the cover is the gap plus that";
+
+  aggregator->close();
+}
+
+// L4 M1: the local pre-aggregation accumulates in memory and flushes
+// partial rows [key, intermediate, windowEnd] when the watermark fires
+// the buffered slices - data before watermark (the two-stage ordering
+// contract).
+TEST_F(WindowAggregatorTest, testLocalFlushesOnWatermark) {
+  auto capture = std::make_unique<CaptureTarget>(driverCtx_.get(), nextNodeId());
+  auto* capturePtr = capture.get();
+  auto aggregator = makeLocalAggregator(
+      makeLocalNode(
+          {sumOfC()},
+          ROW({"k", "sum", "window_end"}, {BIGINT(), BIGINT(), BIGINT()}),
+          5000,
+          0,
+          1),
+      std::move(capture));
+
+  aggregator->addInput(windowRecord({1, 1}, {1000, 1500}, {10, 5}));
+  aggregator->advance();
+  aggregator->addInput(windowRecord({2}, {3000}, {7}));
+  aggregator->advance();
+  // Watermark before the slice end: buffered, nothing flushed.
+  aggregator->processWatermark(3000);
+  EXPECT_EQ(capturePtr->traceSize(), 1); // just the watermark
+  EXPECT_EQ(capturePtr->records().size(), 0);
+
+  // Watermark past the slice end [0,5000): both partials flush first.
+  aggregator->processWatermark(5999);
+  ASSERT_GE(capturePtr->traceSize(), 2);
+  EXPECT_EQ(capturePtr->kindAt(1), 'R');
+  ASSERT_EQ(capturePtr->records().size(), 1);
+  auto partials = capturePtr->records()[0];
+  ASSERT_EQ(partials->size(), 2);
+  EXPECT_EQ(
+      partials->childAt(0)->asFlatVector<int64_t>()->valueAt(0), 1);
+  EXPECT_EQ(
+      partials->childAt(0)->asFlatVector<int64_t>()->valueAt(1), 2);
+  EXPECT_EQ(
+      partials->childAt(1)->asFlatVector<int64_t>()->valueAt(0), 15);
+  EXPECT_EQ(
+      partials->childAt(1)->asFlatVector<int64_t>()->valueAt(1), 7);
+  EXPECT_EQ(
+      partials->childAt(2)->asFlatVector<int64_t>()->valueAt(0), 5000);
+  EXPECT_EQ(
+      partials->childAt(2)->asFlatVector<int64_t>()->valueAt(1), 5000);
+
+  aggregator->close();
+}
+
+// L4 M1: rows of the same (key, slice) across batches pre-aggregate
+// into ONE partial row.
+TEST_F(WindowAggregatorTest, testLocalSameSliceAcrossBatches) {
+  auto capture = std::make_unique<CaptureTarget>(driverCtx_.get(), nextNodeId());
+  auto* capturePtr = capture.get();
+  auto aggregator = makeLocalAggregator(
+      makeLocalNode(
+          {countStarOfC()},
+          ROW({"k", "cnt", "window_end"}, {BIGINT(), BIGINT(), BIGINT()}),
+          5000,
+          0,
+          1),
+      std::move(capture));
+
+  aggregator->addInput(windowRecord({1, 1, 1}, {1000, 2000, 3000}, {1, 2, 3}));
+  aggregator->advance();
+  aggregator->addInput(windowRecord({1}, {4000}, {4}));
+  aggregator->advance();
+  aggregator->processWatermark(9999);
+
+  ASSERT_EQ(capturePtr->records().size(), 1);
+  auto partials = capturePtr->records()[0];
+  ASSERT_EQ(partials->size(), 1);
+  EXPECT_EQ(partials->childAt(0)->asFlatVector<int64_t>()->valueAt(0), 1);
+  EXPECT_EQ(partials->childAt(1)->asFlatVector<int64_t>()->valueAt(0), 4);
+  EXPECT_EQ(partials->childAt(2)->asFlatVector<int64_t>()->valueAt(0), 5000);
+
+  aggregator->close();
+}
+
+// L4 M1: HOP rows in different slices pre-aggregate into separate
+// partials with the slice ends as the windowEnd column.
+TEST_F(WindowAggregatorTest, testLocalHopDistinctSliceEnds) {
+  auto capture = std::make_unique<CaptureTarget>(driverCtx_.get(), nextNodeId());
+  auto* capturePtr = capture.get();
+  auto aggregator = makeLocalAggregator(
+      makeLocalNode(
+          {sumOfC()},
+          ROW({"k", "sum", "window_end"}, {BIGINT(), BIGINT(), BIGINT()}),
+          4000,
+          2000,
+          0),
+      std::move(capture));
+
+  aggregator->addInput(windowRecord({1, 1}, {1000, 3000}, {10, 20}));
+  aggregator->advance();
+  aggregator->processWatermark(9999);
+
+  ASSERT_EQ(capturePtr->records().size(), 1);
+  auto partials = capturePtr->records()[0];
+  ASSERT_EQ(partials->size(), 2);
+  EXPECT_EQ(partials->childAt(1)->asFlatVector<int64_t>()->valueAt(0), 10);
+  EXPECT_EQ(partials->childAt(2)->asFlatVector<int64_t>()->valueAt(0), 2000);
+  EXPECT_EQ(partials->childAt(1)->asFlatVector<int64_t>()->valueAt(1), 20);
+  EXPECT_EQ(partials->childAt(2)->asFlatVector<int64_t>()->valueAt(1), 4000);
 
   aggregator->close();
 }

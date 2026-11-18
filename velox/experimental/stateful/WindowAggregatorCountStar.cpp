@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 #include "velox/experimental/stateful/WindowAggregator.h"
+#include "velox/vector/ComplexVector.h"
 
 namespace facebook::velox::stateful {
 
@@ -63,6 +64,24 @@ int32_t countStarColumnOffset(TypeKind intermediateKind, int32_t offset) {
       TypeKind::BIGINT,
       "The count star accumulator column must be BIGINT");
   return offset;
+}
+
+// Keyless windows (empty grouping): gluten declares the input one column
+// wider than the runtime batches (a trailing constant BIGINT
+// "$keyless_key"); this wraps the column onto a runtime batch so the
+// keyed backends can key on it. Shared by WindowAggregator and
+// LocalWindowAggregator; lives in this cold TU so the hot operator TUs
+// stay unperturbed.
+RowVectorPtr wrapKeylessColumn(
+    memory::MemoryPool* pool,
+    const RowTypePtr& declaredInputType,
+    const RowVectorPtr& input) {
+  const auto numRows = input->size();
+  auto children = input->children();
+  children.push_back(std::make_shared<ConstantVector<int64_t>>(
+      pool, numRows, /*isNull=*/false, BIGINT(), int64_t(0)));
+  return std::make_shared<RowVector>(
+      pool, declaredInputType, nullptr, numRows, std::move(children));
 }
 
 } // namespace facebook::velox::stateful

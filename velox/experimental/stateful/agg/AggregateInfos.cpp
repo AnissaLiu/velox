@@ -57,7 +57,8 @@ std::vector<exec::AggregateInfo> makeAggregateInfos(
     const RowTypePtr& outputType,
     column_index_t numLeadingColumns,
     const core::QueryConfig& queryConfig,
-    memory::MemoryPool* pool) {
+    memory::MemoryPool* pool,
+    core::AggregationNode::Step step) {
   std::vector<exec::AggregateInfo> infos;
   infos.reserve(aggregates.size());
   for (auto i = 0; i < aggregates.size(); ++i) {
@@ -103,8 +104,10 @@ std::vector<exec::AggregateInfo> makeAggregateInfos(
     // function's signature produces; a mismatch would otherwise surface
     // later at value extraction without naming the function.
     const auto& declaredResult = outputType->childAt(numLeadingColumns + i);
-    const auto signatureResult =
-        resolveFinalResultType(aggregate.call->name(), aggregate.rawInputTypes);
+    const auto signatureResult = step ==
+            core::AggregationNode::Step::kPartial
+        ? info.intermediateType
+        : resolveFinalResultType(aggregate.call->name(), aggregate.rawInputTypes);
     VELOX_USER_CHECK(
         *signatureResult == *declaredResult,
         "Aggregate function {} produces {}, but the declared output column "
@@ -114,7 +117,7 @@ std::vector<exec::AggregateInfo> makeAggregateInfos(
         declaredResult->toString());
     info.function = exec::Aggregate::create(
         aggregate.call->name(),
-        core::AggregationNode::Step::kSingle,
+        step,
         aggregate.rawInputTypes,
         outputType->childAt(numLeadingColumns + i),
         queryConfig);

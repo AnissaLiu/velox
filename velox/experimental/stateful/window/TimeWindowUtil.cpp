@@ -106,38 +106,6 @@ bool TimeWindowUtil::isWindowFired(
 }
 
 // static
-int64_t TimeWindowUtil::getNextTriggerWatermark(
-    int64_t currentWatermark,
-    int64_t interval,
-    int shiftTimezone,
-    bool useDayLightSaving) {
-  if (currentWatermark == INT64_MAX) {
-    return currentWatermark;
-  }
-
-  int64_t triggerWatermark;
-  // consider the DST timezone
-  if (useDayLightSaving) {
-    // TODO: support time zone
-    // int64_t utcWindowStart =
-    //          getWindowStartWithOffset(
-    //                  toUtcTimestampMills(currentWatermark, shiftTimezone),
-    //                  0L, interval);
-    // triggerWatermark = toEpochMillsForTimer(utcWindowStart + interval - 1,
-    // shiftTimezone);
-  } else {
-    int64_t start = getWindowStartWithOffset(currentWatermark, 0L, interval);
-    triggerWatermark = start + interval - 1;
-  }
-
-  if (triggerWatermark > currentWatermark) {
-    return triggerWatermark;
-  } else {
-    return triggerWatermark + interval;
-  }
-}
-
-// static
 int64_t TimeWindowUtil::getWindowStartWithOffset(
     int64_t timestamp,
     int64_t offset,

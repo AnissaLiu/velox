@@ -55,12 +55,6 @@ class TimeWindowUtil {
       int64_t currentProgress,
       const tzdb::time_zone* zone);
 
-  static int64_t getNextTriggerWatermark(
-      int64_t currentWatermark,
-      int64_t interval,
-      int shiftTimezone,
-      bool useDayLightSaving);
-
   static int64_t getWindowStartWithOffset(
       int64_t timestamp,
       int64_t offset,

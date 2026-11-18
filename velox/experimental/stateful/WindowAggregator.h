@@ -223,11 +223,6 @@ class WindowAggregator : public StatefulOperator {
   /// Shuts the proc-time wake-up scheduler down (close path).
   void shutdownProcTimeScheduler();
 
-  /// Keyless mode: appends the "$keyless_key" constant BIGINT column the
-  /// declared input type carries (gluten adds it for empty grouping) to
-  /// a runtime batch, which is one column narrower.
-  RowVectorPtr wrapKeylessColumn(const RowVectorPtr& input);
-
   /// Batch accumulator initialization for freshly materialized state rows.
   void initializeRows(char** rows, size_t numRows);
 
@@ -333,5 +328,14 @@ int32_t findCountStarIndex(
     bool requireCountStar);
 bool countStarIsZero(const char* row, int32_t countStarOffset);
 int32_t countStarColumnOffset(TypeKind intermediateKind, int32_t offset);
+
+/// Keyless mode: appends the "$keyless_key" constant BIGINT column the
+/// declared input type carries (gluten adds it for empty grouping) to a
+/// runtime batch, which is one column narrower. Shared by the window
+/// aggregators; implemented in the cold count-star TU.
+RowVectorPtr wrapKeylessColumn(
+    memory::MemoryPool* pool,
+    const RowTypePtr& declaredInputType,
+    const RowVectorPtr& input);
 
 } // namespace facebook::velox::stateful

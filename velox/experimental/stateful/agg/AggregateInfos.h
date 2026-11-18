@@ -36,12 +36,18 @@ namespace facebook::velox::stateful {
 /// today, window aggregation later. 'numLeadingColumns' is the number of
 /// output channels ahead of the first aggregate's output (the key columns
 /// for group aggregation, keys and window columns for window aggregation).
+/// 'step' picks the cross-check on the declared output column: kSingle
+/// (default) checks the FINAL result type, kPartial - the two-stage
+/// local pre-aggregation - checks the INTERMEDIATE accumulator type
+/// the local stage emits. The function is created at the same step.
 std::vector<exec::AggregateInfo> makeAggregateInfos(
     const std::vector<core::AggregationNode::Aggregate>& aggregates,
     const RowTypePtr& inputType,
     const RowTypePtr& outputType,
     column_index_t numLeadingColumns,
     const core::QueryConfig& queryConfig,
-    memory::MemoryPool* pool);
+    memory::MemoryPool* pool,
+    core::AggregationNode::Step step =
+        core::AggregationNode::Step::kSingle);
 
 } // namespace facebook::velox::stateful

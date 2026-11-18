@@ -122,7 +122,8 @@ void WindowAggregator::initialize() {
   VELOX_CHECK_EQ(
       freeColumns,
       static_cast<int32_t>(aggNode->aggregates().size()),
-      "Output schema must be keys + window_start/end + aggregates, got {}",
+      "Output schema must be keys + aggregates + window_start/end in some "
+      "order, got {}",
       outputType->toString());
   numLeadingColumns_ = -1;
   for (int32_t c = 0; c < static_cast<int32_t>(outputType->size()); ++c) {
@@ -244,7 +245,9 @@ void WindowAggregator::addInput(StreamElementPtr input) {
   auto record = std::static_pointer_cast<StreamRecord>(input);
   checkInputRowKinds(*record);
   VELOX_CHECK(!input_, "Last input has not been processed");
-  input_ = keyless_ ? wrapKeylessColumn(record->record()) : record->record();
+  input_ = keyless_
+      ? wrapKeylessColumn(memoryPool(), declaredInputType_, record->record())
+      : record->record();
 }
 
 void WindowAggregator::advance() {
@@ -1137,19 +1140,6 @@ void WindowAggregator::shutdownProcTimeScheduler() {
     procTimeScheduler_->close();
     procTimeScheduler_.reset();
   }
-}
-
-RowVectorPtr WindowAggregator::wrapKeylessColumn(const RowVectorPtr& input) {
-  const auto numRows = input->size();
-  auto children = input->children();
-  children.push_back(std::make_shared<ConstantVector<int64_t>>(
-      memoryPool(), numRows, /*isNull=*/false, BIGINT(), int64_t(0)));
-  return std::make_shared<RowVector>(
-      memoryPool(),
-      declaredInputType_,
-      nullptr,
-      numRows,
-      std::move(children));
 }
 
 } // namespace facebook::velox::stateful
