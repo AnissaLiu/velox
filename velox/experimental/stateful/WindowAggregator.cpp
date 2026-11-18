@@ -909,14 +909,29 @@ void WindowAggregator::fireSessionWindow(
 
 void WindowAggregator::mergeAccumulatorRows(char* targetRow, char* sourceRow) {
   // One-row intermediate extraction per aggregate, merged into the
-  // target accumulator — the same path restore uses (mergeRow).
-  std::vector<VectorPtr> columns(aggregates_.size());
-  for (size_t i = 0; i < aggregates_.size(); ++i) {
-    columns[i] = BaseVector::create(
-        aggregates_[i].intermediateType, 1, memoryPool());
-    aggregates_[i].function->extractAccumulators(&sourceRow, 1, &columns[i]);
+  // target accumulator - the same path restore uses (mergeRow). The
+  // intermediate columns live in a member scratch and are reused
+  // across calls: the HOP fire heap-merges (size/slide - 1) slice
+  // accumulators per window and the SESSION merge folds merged-away
+  // state windows, and a ladder measurement attributes ~half of the
+  // HOP wall time to these merges - dominated by the per-merge vector
+  // allocation. Reuse is observation-free: extractAccumulators
+  // overwrites row 0, the merge consumes the columns synchronously
+  // before the next call, the vector slot is passed by reference (a
+  // representation swap updates the scratch in place), and the
+  // operator runs on a single task thread.
+  if (mergeScratchColumns_.size() != aggregates_.size()) {
+    mergeScratchColumns_.assign(aggregates_.size(), nullptr);
+    for (size_t i = 0; i < aggregates_.size(); ++i) {
+      mergeScratchColumns_[i] = BaseVector::create(
+          aggregates_[i].intermediateType, 1, memoryPool());
+    }
   }
-  mergeRow(targetRow, columns);
+  for (size_t i = 0; i < aggregates_.size(); ++i) {
+    aggregates_[i].function->extractAccumulators(
+        &sourceRow, 1, &mergeScratchColumns_[i]);
+  }
+  mergeRow(targetRow, mergeScratchColumns_);
 }
 
 void WindowAggregator::emitWindowResult(
@@ -1028,8 +1043,12 @@ void WindowAggregator::mergeRow(
     char* row,
     const std::vector<VectorPtr>& columns) {
   for (size_t i = 0; i < aggregates_.size(); ++i) {
+    // Reused single-argument vector: the merge consumes the input
+    // synchronously, and a fresh {columns[i]} per aggregate per merge
+    // is a hidden allocation on the HOP fire path.
+    singleIntermediateArg_[0] = columns[i];
     aggregates_[i].function->addSingleGroupIntermediateResults(
-        row, SelectivityVector(1), {columns[i]}, false);
+        row, SelectivityVector(1), singleIntermediateArg_, false);
   }
 }
 
