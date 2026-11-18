@@ -129,6 +129,11 @@ class WindowAggregator : public StatefulOperator {
   struct FireEntry {
     RowContainerStateKey key;
     SliceEndNs ns;
+    /// The owning window's start: the merged window's start for SESSION
+    /// (emission needs the full range), the group/window start for the
+    /// aligned types (kept uniform; the aligned fire paths recompute
+    /// theirs).
+    int64_t windowStart = 0;
   };
 
   /// Fires all fire-index entries with dueTs <= progress, per window type.
@@ -136,7 +141,10 @@ class WindowAggregator : public StatefulOperator {
 
   /// Fires one (key, windowEnd) of an unshared window (TUMBLE): reads the
   /// accumulator read-only, emits the result row (+I), clears the slice.
-  void fireWindow(const RowContainerStateKey& key, int64_t windowEnd);
+  void fireWindow(
+      const RowContainerStateKey& key,
+      int64_t windowStart,
+      int64_t windowEnd);
 
   /// Fires one HOP window: heap-merges the covered slices' accumulators
   /// into the first slice, emits, clears the first slice only, and chains
@@ -160,12 +168,39 @@ class WindowAggregator : public StatefulOperator {
   /// Window start from window end (all window types: end - size).
   int64_t windowStart(int64_t windowEnd) const;
 
-  /// Adds a (key, windowEnd) pair to the fire index at dueTs = windowEnd
-  /// - 1, deduplicated per (key row, windowEnd): Flink registers each
-  /// (key, namespace) timer once; a duplicate registration would fire an
-  /// already-cleared window and emit an empty result row.
+  /// Adds a (key, windowStart, windowEnd) entry to the fire index at
+  /// dueTs = windowEnd - 1, deduplicated per (key row, windowEnd):
+  /// Flink registers each (key, namespace) timer once; a duplicate
+  /// registration would fire an already-cleared window and emit an
+  /// empty result row.
   void registerFire(
       const RowContainerStateKey& key,
+      int64_t windowStart,
+      int64_t windowEnd);
+
+  /// Removes the (key, windowEnd) fire registration - the SESSION merge
+  /// path's timer re-hang (Flink clears the merged-away windows'
+  /// triggers in the merge callback,
+  /// MergingWindowProcessFunction.java:178-182).
+  void unregisterFire(
+      const RowContainerStateKey& key,
+      int64_t windowEnd);
+
+  /// SESSION advance: per row opens [ts, ts+gap), merges intersecting
+  /// in-flight windows (accumulators pinned to the surviving state
+  /// window, Flink MergingWindowSet), accumulates into that state
+  /// window and re-hangs fire registrations to the merged window end
+  /// (Flink UnsliceWindowAggProcessor#processElement).
+  void advanceSession();
+
+  /// Fires one merged session window [windowStart, windowEnd): resolves
+  /// the state window through the persistent mapping (a miss is a stale
+  /// registration - merged-away or retired - and fires nothing), emits
+  /// from the state window's accumulator, then clears the accumulator
+  /// and retires the mapping entry (Flink cleanWindowIfNeeded).
+  void fireSessionWindow(
+      const RowContainerStateKey& key,
+      int64_t windowStart,
       int64_t windowEnd);
 
   /// Processing-time mode only: (re-)arms the one-shot background wake-up
@@ -204,8 +239,22 @@ class WindowAggregator : public StatefulOperator {
 
   /// Deduplication set for the fire index, keyed by (key row, windowEnd).
   /// Entries are inserted in registerFire() and erased when the
-  /// corresponding multimap entry is popped in fireDue().
+  /// corresponding multimap entry is popped in fireDue() (or re-hung by
+  /// a SESSION merge in unregisterFire()).
   std::set<std::pair<const char*, int64_t>> registeredFires_;
+
+  /// SESSION only: accumulators keyed by the pinned state-window
+  /// namespace (Flink MergingWindowSet's "state window"); null for the
+  /// aligned types, which use state_.
+  std::shared_ptr<AggregatingState<RowContainerStateKey, TimeWindowNs>>
+      sessionState_;
+
+  /// SESSION only: the persistent actual-window -> state-window mapping
+  /// (Flink's "session-window-mapping" MapState; the in-flight window
+  /// set is rebuilt from it per key per batch). Null for the aligned
+  /// types.
+  std::shared_ptr<MapState<RowContainerStateKey, SliceEndNs, TimeWindowNs, TimeWindowNs>>
+      mappingState_;
 
   /// Processing-time wake-up: a background one-shot timer at the fire
   /// index head that asks Java (via NativeCallbackBridge::onProcessingTime)

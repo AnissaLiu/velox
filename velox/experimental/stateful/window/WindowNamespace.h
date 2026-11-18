@@ -65,6 +65,11 @@ class TimeWindowNs : public Namespace {
  public:
   TimeWindowNs(int64_t start, int64_t end) : start_(start), end_(end) {}
 
+  /// Default (0, 0): the heap MapState's stored std::map requires
+  /// default-constructible user values (Flink TimeWindow has the same
+  /// no-arg constructor for serialization).
+  TimeWindowNs() : start_(0), end_(0) {}
+
   int64_t start() const {
     return start_;
   }
@@ -76,6 +81,17 @@ class TimeWindowNs : public Namespace {
   bool equals(const Namespace& other) const override {
     auto* that = dynamic_cast<const TimeWindowNs*>(&other);
     return that != nullptr && start_ == that->start_ && end_ == that->end_;
+  }
+
+  /// (start, end) lexicographic order, Flink TimeWindow#compareTo; the
+  /// ordered in-flight window set (std::map key) relies on it.
+  bool operator<(const TimeWindowNs& other) const {
+    return start_ < other.start_ ||
+        (start_ == other.start_ && end_ < other.end_);
+  }
+
+  bool operator==(const TimeWindowNs& other) const {
+    return start_ == other.start_ && end_ == other.end_;
   }
 
   uint64_t hash() const override {

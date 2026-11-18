@@ -48,12 +48,13 @@ void WindowAggregator::initialize() {
       node_->keyedStateSpec(),
       "StreamWindowAggregationNode must carry a KeyedStateSpec");
   const WindowType wt = static_cast<WindowType>(node_->windowType());
-  // TODO(L5): support CUMULATE and SESSION windows in a follow-up task;
-  // running them through the aligned-window logic would silently
-  // produce wrong results.
-  if (wt != WindowType::HOP && wt != WindowType::TUMBLE) {
+  // TODO(L5): CUMULATE is deferred (preserved on the
+  // window-agg-cumulate-deferred branch); running it through the
+  // aligned-window logic would silently produce wrong results.
+  if (wt != WindowType::HOP && wt != WindowType::TUMBLE &&
+      wt != WindowType::SESSION) {
     VELOX_UNSUPPORTED(
-        "WindowAggregator does not support CUMULATE/SESSION windows yet (L5)");
+        "WindowAggregator does not support CUMULATE windows yet (L5)");
   }
   VELOX_CHECK_GT(
       node_->size(), 0, "window size must be positive, got {}", node_->size());
@@ -186,10 +187,32 @@ void WindowAggregator::initializeStateBackend(StateBackend* stateBackend) {
         mergeRow(row, columns);
       },
       memoryPool());
-  state_ =
-      keyedBackend_->getOrCreateAggregatingState<SliceEndNs>(descriptor);
+  const bool isSession =
+      static_cast<WindowType>(node_->windowType()) == WindowType::SESSION;
+  if (isSession) {
+    // SESSION: accumulators live under the pinned state-window
+    // namespace; the persistent actual->state mapping is the
+    // "session-window-mapping" MapState (Flink
+    // MergingWindowProcessFunction#open, under a constant namespace -
+    // the map is per key).
+    state_.reset();
+    sessionState_ =
+        keyedBackend_->getOrCreateAggregatingState<TimeWindowNs>(descriptor);
+    MapStateDescriptor<TimeWindowNs, TimeWindowNs> mappingDescriptor(
+        "session-window-mapping",
+        std::make_shared<TimeWindowNsSerializer>(),
+        std::make_shared<TimeWindowNsSerializer>(),
+        memoryPool());
+    mappingState_ = keyedBackend_->getOrCreateMapState<SliceEndNs, TimeWindowNs, TimeWindowNs>(
+        mappingDescriptor);
+   } else {
+    state_ =
+        keyedBackend_->getOrCreateAggregatingState<SliceEndNs>(descriptor);
+    sessionState_.reset();
+    mappingState_.reset();
+  }
 
-  auto* valueRows = state_->valueRows();
+  auto* valueRows = isSession ? sessionState_->valueRows() : state_->valueRows();
   for (size_t i = 0; i < aggregates_.size(); ++i) {
     auto& function = aggregates_[i].function;
     function->setAllocator(&valueRows->stringAllocator());
@@ -236,6 +259,20 @@ void WindowAggregator::advance() {
   if (numRows == 0) {
     input_.reset();
     keyedBackend_->advance();
+    return;
+  }
+
+  if (static_cast<WindowType>(node_->windowType()) == WindowType::SESSION) {
+    // SESSION takes the unslice path: per-row windows merged on arrival
+    // (Flink UnsliceWindowAggProcessor); the slice machinery below is
+    // the aligned-window path only.
+    advanceSession();
+    input_.reset();
+    keyedBackend_->advance();
+    if (!node_->isEventTime() && procTimeScheduler_) {
+      fireDue(TimeWindowUtil::getCurrentProcessingTime());
+      armProcTimeWakeUp();
+    }
     return;
   }
 
@@ -341,7 +378,10 @@ void WindowAggregator::advance() {
       }
     }
     for (vector_size_t d = 0; d < sliceNumDistinct; ++d) {
-      registerFire(distinctKeys[d], fireWindowEnd);
+      registerFire(
+          distinctKeys[d],
+          sliceAssigner_->getWindowStart(fireWindowEnd),
+          fireWindowEnd);
     }
   }
 
@@ -395,6 +435,8 @@ void WindowAggregator::close() {
   }
   input_.reset();
   state_.reset();
+  sessionState_.reset();
+  mappingState_.reset();
   keyedBackend_.reset();
   keySelector_.reset();
   fireIndex_.clear();
@@ -408,10 +450,11 @@ void WindowAggregator::fireDue(int64_t progress) {
   while (!fireIndex_.empty() && fireIndex_.begin()->first <= progress) {
     auto it = fireIndex_.begin();
     auto key = it->second.key;
+    auto windowStart = it->second.windowStart;
     auto windowEnd = it->second.ns.sliceEnd();
     registeredFires_.erase({key.row(), windowEnd});
     fireIndex_.erase(it);
-    fireWindow(key, windowEnd);
+    fireWindow(key, windowStart, windowEnd);
   }
   if (!node_->isEventTime() && procTimeScheduler_) {
     armProcTimeWakeUp();
@@ -420,10 +463,15 @@ void WindowAggregator::fireDue(int64_t progress) {
 
 void WindowAggregator::fireWindow(
     const RowContainerStateKey& key,
+    int64_t windowStart,
     int64_t windowEnd) {
   const WindowType wt = static_cast<WindowType>(node_->windowType());
   if (wt == WindowType::HOP) {
     fireHopWindow(key, windowEnd);
+    return;
+  }
+  if (wt == WindowType::SESSION) {
+    fireSessionWindow(key, windowStart, windowEnd);
     return;
   }
   // TUMBLE: the slice is the window. Read-only peek: a miss means the
@@ -438,7 +486,7 @@ void WindowAggregator::fireWindow(
   // whose count star reads 0 emits nothing. Cleanup still runs (Flink
   // fireWindow suppresses collect, then clearWindow removes the state).
   if (!countStarIsZero(row, countStarOffset_)) {
-    emitWindowResult(key, windowStart(windowEnd), windowEnd, row);
+    emitWindowResult(key, windowStart, windowEnd, row);
   }
   state_->remove(key, ns);
 }
@@ -517,8 +565,251 @@ void WindowAggregator::fireHopWindow(
     }
   }
   if (nextHasState) {
-    registerFire(key, nextWindowEnd);
+    registerFire(key, windowStart(nextWindowEnd), nextWindowEnd);
   }
+}
+
+
+namespace {
+
+// Flink TimeWindow#intersects / cover (SessionWindowAssigner#mergeWindow).
+// NOTE: Flink's intersects is inclusive on both bounds - sessions split
+// only when the row interval EXCEEDS the gap (an interval exactly equal
+// to the gap still merges; native-verified on the session smoke).
+bool sessionWindowsIntersect(const TimeWindowNs& a, const TimeWindowNs& b) {
+  return a.start() <= b.end() && a.end() >= b.start();
+}
+
+TimeWindowNs sessionWindowCover(const TimeWindowNs& a, const TimeWindowNs& b) {
+  return TimeWindowNs(
+      std::min(a.start(), b.start()), std::max(a.end(), b.end()));
+}
+
+// The session-window-mapping lives under a constant namespace: the map
+// is per key (Flink registers it under VoidNamespace).
+const SliceEndNs kMappingNs{0};
+
+} // namespace
+
+void WindowAggregator::advanceSession() {
+  // Flink UnsliceWindowAggProcessor#processElement over the
+  // MergingWindowSet: each row opens [ts, ts+gap); intersecting
+  // in-flight windows merge into the cover, the accumulator stays
+  // pinned to the surviving state window ("avoid costly state
+  // juggling", MergingWindowSet.java:64-68) with the others folded in
+  // and dropped; the row accumulates into that state window and the
+  // fire registration re-hangs to the merged window end.
+  const int64_t gap = node_->size();
+  const auto numRows = input_->size();
+
+  // Per-row UTC timestamps; a proc-time batch shares the batch-arrival
+  // instant (the aligned-window convention).
+  std::vector<int64_t> rowTs(numRows);
+  if (node_->isEventTime()) {
+    const auto& rowtimeVector = input_->childAt(node_->rowtimeIndex());
+    const auto* tsSimple = rowtimeVector->as<SimpleVector<Timestamp>>();
+    const auto* tsSimpleInt = rowtimeVector->as<SimpleVector<int64_t>>();
+    VELOX_CHECK(
+        tsSimple != nullptr || tsSimpleInt != nullptr,
+        "rowtime column must be TIMESTAMP/Int64 simple vector");
+    for (vector_size_t row = 0; row < numRows; ++row) {
+      VELOX_CHECK(
+          !(tsSimple ? tsSimple->isNullAt(row) : tsSimpleInt->isNullAt(row)),
+          "RowTime field should not be null");
+      const int64_t ms = tsSimple ? tsSimple->valueAt(row).toMillis()
+                                  : tsSimpleInt->valueAt(row);
+      rowTs[row] = TimeWindowUtil::toUtcTimestampMills(ms, tz_);
+    }
+  } else {
+    const int64_t now = TimeWindowUtil::toUtcTimestampMills(
+        TimeWindowUtil::getCurrentProcessingTime(), tz_);
+    std::fill(rowTs.begin(), rowTs.end(), now);
+  }
+
+  // One batch-level key probe, then per-key in-order window merging.
+  keySelector_->probe(input_);
+  const auto distinctKeys = keySelector_->distinctKeys();
+  const auto perRowKeys = keySelector_->keys();
+  rowToDistinct_.clear();
+  for (vector_size_t d = 0; d < static_cast<vector_size_t>(distinctKeys.size());
+       ++d) {
+    rowToDistinct_[distinctKeys[d].row()] = d;
+  }
+  std::vector<std::vector<vector_size_t>> rowsOfKey(distinctKeys.size());
+  for (vector_size_t row = 0; row < numRows; ++row) {
+    rowsOfKey[rowToDistinct_[perRowKeys[row].row()]].push_back(row);
+  }
+
+  rowGroups_.resize(numRows);
+  SelectivityVector keptRows(numRows, true);
+  bool anyDropped = false;
+
+  for (vector_size_t d = 0; d < static_cast<vector_size_t>(distinctKeys.size());
+       ++d) {
+    const auto& key = distinctKeys[d];
+    // The in-flight window set for this key, ordered by (start, end):
+    // rebuilt from the persistent mapping once per key per batch (the
+    // truth source; Flink keeps an LRU cache per record - same content,
+    // different cache granularity).
+    auto inFlight = mappingState_->entries(key, kMappingNs);
+
+    for (vector_size_t row : rowsOfKey[d]) {
+      const TimeWindowNs newWindow(rowTs[row], rowTs[row] + gap);
+
+      // SessionWindowAssigner#mergeWindows: the disjoint in-flight set
+      // can intersect the new window from the right (ceiling) and the
+      // left (floor) only; both fold into the running cover.
+      auto ceil = inFlight.lower_bound(newWindow);
+      auto floor =
+          (ceil == inFlight.begin()) ? inFlight.end() : std::prev(ceil);
+      TimeWindowNs result = newWindow;
+      std::vector<TimeWindowNs> merged;
+      if (ceil != inFlight.end() &&
+          sessionWindowsIntersect(ceil->first, result)) {
+        merged.push_back(ceil->first);
+        result = sessionWindowCover(result, ceil->first);
+      }
+      if (floor != inFlight.end() &&
+          sessionWindowsIntersect(floor->first, result)) {
+        merged.push_back(floor->first);
+        result = sessionWindowCover(result, floor->first);
+      }
+
+      if (merged.empty()) {
+        // A self-contained window that is already late retires without
+        // touching the mapping or the fire index (Flink retires from
+        // the cache after addWindow; the row drops before any state or
+        // timer write).
+        if (node_->isEventTime() &&
+            TimeWindowUtil::isWindowFired(result.end(), currentProgress_, tz_)) {
+          lateDroppedRows_++;
+          keptRows.setValid(row, false);
+          anyDropped = true;
+          continue;
+        }
+        inFlight.emplace(newWindow, newWindow);
+        mappingState_->put(key, kMappingNs, newWindow, newWindow);
+        registerFire(key, newWindow.start(), newWindow.end());
+        rowGroups_[row] = sessionState_->row(key, newWindow);
+        continue;
+      }
+
+      // MergingWindowSet#addWindow: the surviving state namespace is
+      // any merged window's state window (Flink picks the first of a
+      // hash-set iteration; the choice is immaterial).
+      const TimeWindowNs stateWin = inFlight.find(merged[0])->second;
+      for (const auto& m : merged) {
+        auto mIt = inFlight.find(m);
+        const TimeWindowNs mState = mIt->second;
+        inFlight.erase(mIt);
+        mappingState_->remove(key, kMappingNs, m);
+        if (!(mState == stateWin)) {
+          // Fold the merged-away state window's accumulator into the
+          // survivor and drop its entry (Flink
+          // DefaultAccMergingConsumer).
+          char* survivor = sessionState_->row(key, stateWin);
+          if (char* source = sessionState_->get(key, mState)) {
+            mergeAccumulatorRows(survivor, source);
+          }
+          sessionState_->remove(key, mState);
+        }
+      }
+      inFlight.emplace(result, stateWin);
+      mappingState_->put(key, kMappingNs, result, stateWin);
+
+      // Timer re-hang: the merged-away ends stop firing; the merged
+      // window registers at its own end (Flink clears the old triggers
+      // and registers the merged one in the merge callback).
+      for (const auto& m : merged) {
+        unregisterFire(key, m.end());
+      }
+      registerFire(key, result.start(), result.end());
+
+      // Defensive late check on the merged window (Flink throws
+      // UnsupportedOperationException on the equivalent - unreachable
+      // under the fire-before-accumulate invariant): retire and drop.
+      if (node_->isEventTime() &&
+          TimeWindowUtil::isWindowFired(result.end(), currentProgress_, tz_)) {
+        inFlight.erase(result);
+        mappingState_->remove(key, kMappingNs, result);
+        unregisterFire(key, result.end());
+        lateDroppedRows_++;
+        keptRows.setValid(row, false);
+        anyDropped = true;
+        continue;
+      }
+
+      rowGroups_[row] = sessionState_->row(key, stateWin);
+    }
+  }
+
+  // One vectorized accumulation pass over the kept rows (late rows
+  // never reached a state window).
+  const SelectivityVector allRows(numRows);
+  std::vector<std::optional<column_index_t>> maskChannels;
+  maskChannels.reserve(aggregates_.size());
+  for (const auto& aggregate : aggregates_) {
+    maskChannels.push_back(aggregate.mask);
+  }
+  exec::AggregationMasks masks(std::move(maskChannels));
+  masks.addInput(input_, allRows);
+  for (size_t i = 0; i < aggregates_.size(); ++i) {
+    auto& aggregate = aggregates_[i];
+    std::vector<VectorPtr> args;
+    args.reserve(aggregate.inputs.size());
+    for (size_t j = 0; j < aggregate.inputs.size(); ++j) {
+      if (aggregate.constantInputs[j] != nullptr) {
+        args.push_back(aggregate.constantInputs[j]);
+      } else {
+        args.push_back(input_->childAt(aggregate.inputs[j]));
+      }
+    }
+    const auto* activeRows = masks.activeRows(i);
+    if (!anyDropped) {
+      aggregate.function->addRawInput(
+          rowGroups_.data(),
+          activeRows != nullptr ? *activeRows : allRows,
+          args,
+          false /* mayPushdown */);
+    } else {
+      SelectivityVector combined(numRows, false);
+      for (vector_size_t row = 0; row < numRows; ++row) {
+        combined.setValid(
+            row,
+            keptRows.isValid(row) &&
+                (activeRows == nullptr || activeRows->isValid(row)));
+      }
+      aggregate.function->addRawInput(
+          rowGroups_.data(), combined, args, false /* mayPushdown */);
+    }
+  }
+}
+
+void WindowAggregator::fireSessionWindow(
+    const RowContainerStateKey& key,
+    int64_t windowStart,
+    int64_t windowEnd) {
+  // Flink prepareAggregateAccumulatorForEmit: resolve the actual
+  // window's state window through the mapping. A miss is a stale
+  // registration (a merged-away or retired window) - fire nothing and
+  // clean nothing.
+  const TimeWindowNs actual(windowStart, windowEnd);
+  const auto stateWin = mappingState_->get(key, kMappingNs, actual);
+  if (!stateWin.has_value()) {
+    return;
+  }
+  char* row = sessionState_->get(key, *stateWin);
+  if (row == nullptr) {
+    return;
+  }
+  if (!countStarIsZero(row, countStarOffset_)) {
+    emitWindowResult(key, windowStart, windowEnd, row);
+  }
+  // cleanWindowIfNeeded: clear the state window's accumulator and
+  // retire the mapping entry - the window becomes invisible to later
+  // rows (late rows open new windows or drop).
+  sessionState_->remove(key, *stateWin);
+  mappingState_->remove(key, kMappingNs, actual);
 }
 
 void WindowAggregator::mergeAccumulatorRows(char* targetRow, char* sourceRow) {
@@ -591,6 +882,7 @@ int64_t WindowAggregator::windowStart(int64_t windowEnd) const {
 
 void WindowAggregator::registerFire(
     const RowContainerStateKey& key,
+    int64_t windowStart,
     int64_t windowEnd) {
   // Due timestamp = window_end - 1 (matching Flink's maxTimestamp).
   // Deduplicated per (key row, windowEnd): Flink's timer service
@@ -600,7 +892,28 @@ void WindowAggregator::registerFire(
   if (registeredFires_.insert({key.row(), windowEnd}).second) {
     fireIndex_.emplace(
         TimeWindowUtil::toEpochMillsForTimer(windowEnd - 1, tz_),
-        FireEntry{key, SliceEndNs(windowEnd)});
+        FireEntry{key, SliceEndNs(windowEnd), windowStart});
+  }
+}
+
+void WindowAggregator::unregisterFire(
+    const RowContainerStateKey& key,
+    int64_t windowEnd) {
+  // The SESSION merge re-hang: Flink clears the merged-away windows'
+  // event-time triggers in the merge callback
+  // (MergingWindowProcessFunction.java:178-182) so an extending merge
+  // never fires at an interior end.
+  if (registeredFires_.erase({key.row(), windowEnd}) > 0) {
+    const int64_t dueTs =
+        TimeWindowUtil::toEpochMillsForTimer(windowEnd - 1, tz_);
+    auto range = fireIndex_.equal_range(dueTs);
+    for (auto it = range.first; it != range.second; ++it) {
+      if (it->second.key.row() == key.row() &&
+          it->second.ns.sliceEnd() == windowEnd) {
+        fireIndex_.erase(it);
+        break;
+      }
+    }
   }
 }
 
@@ -646,11 +959,27 @@ void WindowAggregator::rebuildFireIndex() {
   // currentProgress_ restarts at Long.MIN (progress is not persisted,
   // L3): the first watermark drives everything whose due time it passes,
   // which is the "fire immediately what is due" behavior.
-  state_->forEachEntry([this](
-                           const RowContainerStateKey& key,
-                           const SliceEndNs& ns) {
-    registerFire(key, ns.sliceEnd());
-  });
+  if (sessionState_) {
+    // SESSION: fire entries carry the ACTUAL windows (the mapping's
+    // keys), not the state windows; rebuild per key from the mapping.
+    std::map<const char*, RowContainerStateKey> keys;
+    sessionState_->forEachEntry(
+        [&keys](const RowContainerStateKey& key, const TimeWindowNs& ns) {
+          keys.emplace(key.row(), key);
+        });
+    for (const auto& [rowPtr, key] : keys) {
+      for (const auto& entry : mappingState_->entries(key, kMappingNs)) {
+        registerFire(key, entry.first.start(), entry.first.end());
+      }
+    }
+  } else {
+    state_->forEachEntry([this](
+                             const RowContainerStateKey& key,
+                             const SliceEndNs& ns) {
+      registerFire(
+          key, sliceAssigner_->getWindowStart(ns.sliceEnd()), ns.sliceEnd());
+    });
+  }
   armProcTimeWakeUp();
 }
 
