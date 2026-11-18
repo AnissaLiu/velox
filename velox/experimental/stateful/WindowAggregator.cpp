@@ -599,6 +599,29 @@ void WindowAggregator::advanceSession() {
   // juggling", MergingWindowSet.java:64-68) with the others folded in
   // and dropped; the row accumulates into that state window and the
   // fire registration re-hangs to the merged window end.
+  //
+  // Batch-level amortizations, all semantics preserving (each argued):
+  // - The in-flight set is keyed by start with a mutable (end, state
+  //   window) value: the disjointness invariant (prev.end < tail.start)
+  //   means an in-order row can only intersect the TAIL window, and a
+  //   tail extension merely rewrites the end value - no tree surgery.
+  // - Mapping-state and fire-index mutations are deferred to the end of
+  //   each key's rows and applied as the snapshot-vs-final DIFF (the
+  //   diff is the net change by construction): nothing reads the
+  //   mapping or fires between advanceSession's entry and exit (fires
+  //   run in fireDue from processWatermark/checkWatermarkStatus, and
+  //   the mapping is only read at the fire, at restore, or when the
+  //   next batch builds the in-flight set from it - all outside this
+  //   call), so per-row remove/put and unregister/register collapse to
+  //   the per-key net effect.
+  // - The state row for the current window is cached per key: a row
+  //   only ever accumulates into a live survivor state window, and the
+  //   cache is dropped whenever a merge removes a state window.
+  // - The late check is monotone within a batch: the window end only
+  //   grows, the timer conversion is non-decreasing (the DST gap floors
+  //   to the hour and the ambiguity resolves to a fixed offset), and
+  //   the progress is fixed within the batch - so once a window end
+  //   passes the check, an unchanged end passes again.
   const int64_t gap = node_->size();
   const auto numRows = input_->size();
 
@@ -647,32 +670,90 @@ void WindowAggregator::advanceSession() {
   for (vector_size_t d = 0; d < static_cast<vector_size_t>(distinctKeys.size());
        ++d) {
     const auto& key = distinctKeys[d];
-    // The in-flight window set for this key, ordered by (start, end):
-    // rebuilt from the persistent mapping once per key per batch (the
-    // truth source; Flink keeps an LRU cache per record - same content,
-    // different cache granularity).
-    auto inFlight = mappingState_->entries(key, kMappingNs);
+    // The in-flight window set for this key, keyed by start (unique
+    // under the disjointness invariant); the value carries the mutable
+    // end and the pinned state window. Rebuilt from the persistent
+    // mapping once per key per batch (the truth source; Flink keeps an
+    // LRU cache per record - same content, different cache
+    // granularity).
+    // The batch-start snapshot of the persistent mapping (actual ->
+    // state window) doubles as the in-flight set: the row loop below
+    // mutates only this in-memory view, and the per-key NET mapping and
+    // fire mutations applied afterwards are the snapshot-vs-final
+    // diff - the diff IS the net change by construction.
+    std::map<int64_t, std::pair<int64_t, TimeWindowNs>> inFlight;
+    std::set<TimeWindowNs> mappingSnapshot;
+    for (const auto& entry : mappingState_->entries(key, kMappingNs)) {
+      inFlight.emplace(
+          entry.first.start(), std::make_pair(entry.first.end(), entry.second));
+      mappingSnapshot.insert(entry.first);
+    }
+
+    // Batch-local state row cache: a row only accumulates into a live
+    // survivor state window; the cache drops whenever a merge removes
+    // a state window.
+    bool rowCached = false;
+    TimeWindowNs cachedStateWin{};
+    char* cachedRow = nullptr;
 
     for (vector_size_t row : rowsOfKey[d]) {
       const TimeWindowNs newWindow(rowTs[row], rowTs[row] + gap);
 
-      // SessionWindowAssigner#mergeWindows: the disjoint in-flight set
-      // can intersect the new window from the right (ceiling) and the
-      // left (floor) only; both fold into the running cover.
-      auto ceil = inFlight.lower_bound(newWindow);
+      // Tail fast path: an in-order row touches only the last window
+      // (disjointness: every earlier window ends strictly before the
+      // tail starts). Swallowed rows change nothing at all (Flink's
+      // addWindow "same as a pre-existing window" skip); extensions
+      // rewrite the mutable end and defer the mapping/fire churn.
+      if (!inFlight.empty()) {
+        auto tailIt = std::prev(inFlight.end());
+        const int64_t tailStart = tailIt->first;
+        const int64_t tailEnd = tailIt->second.first;
+        const TimeWindowNs tailStateWin = tailIt->second.second;
+        if (tailStart <= newWindow.start() && newWindow.start() <= tailEnd) {
+          // No late check is needed on this path: the merged end is
+          // max(tailEnd, newWindow.end) >= tailEnd, the timer conversion
+          // is non-decreasing in the end (DST gap floors to the hour,
+          // ambiguity resolves to a fixed offset), and the tail is
+          // unfired (in-flight windows are, by induction: batch start
+          // brings only unfired windows - fired ones are retired from
+          // the mapping at fire time - and every extension keeps the
+          // end >= an unfired end). So the merged window cannot be
+          // late - the same argument covers the general merge below.
+          const int64_t extendedEnd = std::max(tailEnd, newWindow.end());
+          if (extendedEnd != tailEnd) {
+            tailIt->second.first = extendedEnd;
+          }
+          if (!rowCached || !(cachedStateWin == tailStateWin)) {
+            cachedRow = sessionState_->row(key, tailStateWin);
+            cachedStateWin = tailStateWin;
+            rowCached = true;
+          }
+          rowGroups_[row] = cachedRow;
+          continue;
+        }
+      }
+
+      // General path: out-of-order rows and fresh windows, probed by
+      // ceiling and floor like SessionWindowAssigner#mergeWindows (the
+      // floor check runs against the running cover).
+      auto ceil = inFlight.lower_bound(newWindow.start());
       auto floor =
           (ceil == inFlight.begin()) ? inFlight.end() : std::prev(ceil);
       TimeWindowNs result = newWindow;
-      std::vector<TimeWindowNs> merged;
-      if (ceil != inFlight.end() &&
-          sessionWindowsIntersect(ceil->first, result)) {
-        merged.push_back(ceil->first);
-        result = sessionWindowCover(result, ceil->first);
+      std::vector<std::pair<int64_t, std::pair<int64_t, TimeWindowNs>>> merged;
+      if (ceil != inFlight.end()) {
+        const TimeWindowNs ceilWindow(ceil->first, ceil->second.first);
+        if (sessionWindowsIntersect(ceilWindow, result)) {
+          merged.push_back(*ceil);
+          result = sessionWindowCover(result, ceilWindow);
+        }
       }
-      if (floor != inFlight.end() &&
-          sessionWindowsIntersect(floor->first, result)) {
-        merged.push_back(floor->first);
-        result = sessionWindowCover(result, floor->first);
+      if (floor != inFlight.end()) {
+        const TimeWindowNs floorWindow(floor->first, floor->second.first);
+        if (sessionWindowsIntersect(floorWindow, result)) {
+          merged.push_back(*floor);
+          result = sessionWindowCover(result, floorWindow);
+        }
       }
 
       if (merged.empty()) {
@@ -680,29 +761,31 @@ void WindowAggregator::advanceSession() {
         // touching the mapping or the fire index (Flink retires from
         // the cache after addWindow; the row drops before any state or
         // timer write).
-        if (node_->isEventTime() &&
-            TimeWindowUtil::isWindowFired(result.end(), currentProgress_, tz_)) {
+        if (node_->isEventTime() && TimeWindowUtil::isWindowFired(
+                                         newWindow.end(), currentProgress_, tz_)) {
           lateDroppedRows_++;
           keptRows.setValid(row, false);
           anyDropped = true;
           continue;
         }
-        inFlight.emplace(newWindow, newWindow);
-        mappingState_->put(key, kMappingNs, newWindow, newWindow);
-        registerFire(key, newWindow.start(), newWindow.end());
-        rowGroups_[row] = sessionState_->row(key, newWindow);
+        inFlight.emplace(
+            newWindow.start(),
+            std::make_pair(newWindow.end(), newWindow));
+        cachedRow = sessionState_->row(key, newWindow);
+        cachedStateWin = newWindow;
+        rowCached = true;
+        rowGroups_[row] = cachedRow;
         continue;
       }
 
       // MergingWindowSet#addWindow: the surviving state namespace is
       // any merged window's state window (Flink picks the first of a
       // hash-set iteration; the choice is immaterial).
-      const TimeWindowNs stateWin = inFlight.find(merged[0])->second;
+      const TimeWindowNs stateWin = merged[0].second.second;
       for (const auto& m : merged) {
-        auto mIt = inFlight.find(m);
-        const TimeWindowNs mState = mIt->second;
+        auto mIt = inFlight.find(m.first);
+        const TimeWindowNs mState = mIt->second.second;
         inFlight.erase(mIt);
-        mappingState_->remove(key, kMappingNs, m);
         if (!(mState == stateWin)) {
           // Fold the merged-away state window's accumulator into the
           // survivor and drop its entry (Flink
@@ -712,34 +795,46 @@ void WindowAggregator::advanceSession() {
             mergeAccumulatorRows(survivor, source);
           }
           sessionState_->remove(key, mState);
+          rowCached = false;
         }
       }
-      inFlight.emplace(result, stateWin);
-      mappingState_->put(key, kMappingNs, result, stateWin);
+      inFlight.insert_or_assign(
+          result.start(), std::make_pair(result.end(), stateWin));
 
-      // Timer re-hang: the merged-away ends stop firing; the merged
-      // window registers at its own end (Flink clears the old triggers
-      // and registers the merged one in the merge callback).
-      for (const auto& m : merged) {
-        unregisterFire(key, m.end());
+      // No late check here either: the cover end dominates every
+      // merged (in-flight, unfired) end, so it is unfired - see the
+      // tail fast path comment for the monotonicity argument.
+      if (!rowCached || !(cachedStateWin == stateWin)) {
+        cachedRow = sessionState_->row(key, stateWin);
+        cachedStateWin = stateWin;
+        rowCached = true;
       }
-      registerFire(key, result.start(), result.end());
+      rowGroups_[row] = cachedRow;
+    }
 
-      // Defensive late check on the merged window (Flink throws
-      // UnsupportedOperationException on the equivalent - unreachable
-      // under the fire-before-accumulate invariant): retire and drop.
-      if (node_->isEventTime() &&
-          TimeWindowUtil::isWindowFired(result.end(), currentProgress_, tz_)) {
-        inFlight.erase(result);
-        mappingState_->remove(key, kMappingNs, result);
-        unregisterFire(key, result.end());
-        lateDroppedRows_++;
-        keptRows.setValid(row, false);
-        anyDropped = true;
-        continue;
+    // Apply the per-key NET change as the snapshot-vs-final diff: the
+    // persistent mapping and the fire index are only consumed outside
+    // advanceSession (fireDue from processWatermark/checkWatermarkStatus,
+    // restore, and the next batch's snapshot build), so intermediate
+    // states are unobservable. Every batch-start actual carries exactly
+    // one fire registration at its end (an invariant maintained by this
+    // same diff), and in-flight window ends are unique under
+    // disjointness, so the fire diff is well defined by end.
+    std::map<TimeWindowNs, TimeWindowNs> finalMapping;
+    for (const auto& [start, value] : inFlight) {
+      finalMapping[TimeWindowNs(start, value.first)] = value.second;
+    }
+    for (const auto& actual : mappingSnapshot) {
+      if (finalMapping.count(actual) == 0) {
+        mappingState_->remove(key, kMappingNs, actual);
+        unregisterFire(key, actual.end());
       }
-
-      rowGroups_[row] = sessionState_->row(key, stateWin);
+    }
+    for (const auto& [actual, stateWin] : finalMapping) {
+      if (mappingSnapshot.count(actual) == 0) {
+        mappingState_->put(key, kMappingNs, actual, stateWin);
+        registerFire(key, actual.start(), actual.end());
+      }
     }
   }
 
