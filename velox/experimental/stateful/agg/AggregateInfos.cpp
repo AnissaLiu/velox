@@ -64,21 +64,43 @@ std::vector<exec::AggregateInfo> makeAggregateInfos(
   for (auto i = 0; i < aggregates.size(); ++i) {
     const auto& aggregate = aggregates[i];
     exec::AggregateInfo info;
-    for (const auto& arg : aggregate.call->inputs()) {
-      if (auto field =
-              dynamic_cast<const core::FieldAccessTypedExpr*>(arg.get())) {
-        info.inputs.push_back(inputType->getChildIdx(field->name()));
-        info.constantInputs.push_back(nullptr);
-      } else if (
-          auto constant =
-              dynamic_cast<const core::ConstantTypedExpr*>(arg.get())) {
-        info.inputs.push_back(kConstantChannel);
-        info.constantInputs.push_back(constant->toConstantVector(pool));
-      } else {
-        VELOX_NYI("Unsupported aggregate argument: {}", arg->toString());
+    if (step == core::AggregationNode::Step::kFinal) {
+      // The two-stage global side consumes the partial row [keys,
+      // intermediates, windowEnd]: each aggregate's input is its
+      // intermediate column at the fixed position ahead of the trailing
+      // windowEnd, merged via addIntermediateResults. The call's
+      // rawInputTypes still describe the ORIGINAL input (they drive the
+      // intermediate-type resolution below); the field-name resolution
+      // does not apply to the partial row. Keyless: the declared input
+      // carries the wrapped "$keyless_key" column AFTER windowEnd, so
+      // the trailing windowEnd sits one column further left.
+      column_index_t windowEndPos = inputType->size() - 1;
+      if (std::string(inputType->nameOf(windowEndPos)) == "$keyless_key") {
+        --windowEndPos;
+      }
+      info.inputs.push_back(
+          windowEndPos - static_cast<column_index_t>(aggregates.size()) + i);
+      info.constantInputs.push_back(nullptr);
+      // The FINAL stage never re-applies filters: the local stage
+      // filtered its raw accumulation and the partial row carries no
+      // mask column (Flink two-phase semantics).
+    } else {
+      for (const auto& arg : aggregate.call->inputs()) {
+        if (auto field =
+                dynamic_cast<const core::FieldAccessTypedExpr*>(arg.get())) {
+          info.inputs.push_back(inputType->getChildIdx(field->name()));
+          info.constantInputs.push_back(nullptr);
+        } else if (
+            auto constant =
+                dynamic_cast<const core::ConstantTypedExpr*>(arg.get())) {
+          info.inputs.push_back(kConstantChannel);
+          info.constantInputs.push_back(constant->toConstantVector(pool));
+        } else {
+          VELOX_NYI("Unsupported aggregate argument: {}", arg->toString());
+        }
       }
     }
-    if (aggregate.mask) {
+    if (aggregate.mask && step != core::AggregationNode::Step::kFinal) {
       auto maskField =
           dynamic_cast<const core::FieldAccessTypedExpr*>(aggregate.mask.get());
       VELOX_USER_CHECK(

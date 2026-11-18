@@ -362,6 +362,87 @@ class WindowAggregatorTest : public exec::test::OperatorTestBase {
     return aggregator;
   }
 
+  // The global kFinal node: input = the partial row [k, intermediate,
+  // windowEnd], output = [k, w_start, w_end, final].
+  std::shared_ptr<const StreamWindowAggregationNode> makeGlobalNode(
+      const RowTypePtr& partialInputType,
+      const RowTypePtr& outputType,
+      int64_t size,
+      int64_t step,
+      int windowType,
+      int rowtimeIndex) {
+    const auto id = nextNodeId();
+    std::vector<core::FieldAccessTypedExprPtr> groupingKeys;
+    groupingKeys.push_back(std::make_shared<core::FieldAccessTypedExpr>(
+        BIGINT(), "k"));
+    auto sumAgg = sumOfC();
+    sumAgg.rawInputTypes = {BIGINT()};
+    auto cntAgg = countStarOfC();
+    cntAgg.rawInputTypes = {};
+    std::vector<std::string> aggNames{"a0", "a1"};
+    auto aggregation = std::make_shared<const core::AggregationNode>(
+        core::PlanNodeId{id + "-agg"},
+        core::AggregationNode::Step::kFinal,
+        groupingKeys,
+        std::vector<core::FieldAccessTypedExprPtr>{},
+        aggNames,
+        std::vector<core::AggregationNode::Aggregate>{sumAgg, cntAgg},
+        false,
+        std::make_shared<stateful::EmptyNode>(partialInputType));
+    auto keyedStateSpec = std::make_shared<KeyedStateSpec>(
+        std::vector<column_index_t>{0}, std::vector<TypePtr>{BIGINT()});
+    std::shared_ptr<const core::AggregationNode> noLocalAgg;
+    return std::make_shared<const StreamWindowAggregationNode>(
+        core::PlanNodeId{id},
+        aggregation,
+        noLocalAgg,
+        std::make_shared<exec::HashPartitionFunctionSpec>(
+            partialInputType, std::vector<column_index_t>{0}),
+        std::make_shared<stateful::StreamWindowPartitionFunctionSpec>(
+            partialInputType, rowtimeIndex, size, step, 0,
+            static_cast<WindowType>(windowType)),
+        keyedStateSpec,
+        /*shiftTimeZone=*/"",
+        /*isLocalAgg=*/false,
+        size,
+        step,
+        /*offset=*/0,
+        windowType,
+        outputType,
+        /*isEventTime=*/true,
+        rowtimeIndex,
+        /*windowStartIndex=*/-1,
+        /*windowEndIndex=*/-1);
+  }
+
+  StreamElementPtr partialRecord2(
+      const std::vector<int64_t>& k,
+      const std::vector<int64_t>& partialValue,
+      const std::vector<int64_t>& partialCount,
+      const std::vector<int64_t>& windowEnd) {
+    return std::make_shared<StreamRecord>(
+        "window-agg",
+        makeRowVector(
+            {"k", "a0", "a1", "window_end"},
+            {makeFlatVector<int64_t>(k),
+             makeFlatVector<int64_t>(partialValue),
+             makeFlatVector<int64_t>(partialCount),
+             makeFlatVector<int64_t>(windowEnd)}));
+  }
+
+  StreamElementPtr partialRecord(
+      const std::vector<int64_t>& k,
+      const std::vector<int64_t>& partialValue,
+      const std::vector<int64_t>& windowEnd) {
+    return std::make_shared<StreamRecord>(
+        "window-agg",
+        makeRowVector(
+            {"k", "a0", "window_end"},
+            {makeFlatVector<int64_t>(k),
+             makeFlatVector<int64_t>(partialValue),
+             makeFlatVector<int64_t>(windowEnd)}));
+  }
+
   std::unique_ptr<WindowAggregator> makeAggregator(
       const std::shared_ptr<const StreamWindowAggregationNode>& node,
       std::unique_ptr<StatefulOperator> capture) {
@@ -1142,6 +1223,107 @@ TEST_F(WindowAggregatorTest, testLocalHopDistinctSliceEnds) {
   EXPECT_EQ(partials->childAt(1)->asFlatVector<int64_t>()->valueAt(1), 20);
   EXPECT_EQ(partials->childAt(2)->asFlatVector<int64_t>()->valueAt(1), 4000);
 
+  aggregator->close();
+}
+
+// L4 M2: the global stage (kFinal) consumes the local partials [k,
+// intermediate, windowEnd] - the slice end comes from the appended
+// windowEnd column (attached) and the intermediates merge into the
+// slice state; fire semantics identical to the single-stage path.
+TEST_F(WindowAggregatorTest, testGlobalConsumesPartials) {
+  auto capture = std::make_unique<CaptureTarget>(driverCtx_.get(), nextNodeId());
+  auto* capturePtr = capture.get();
+  const auto partialType =
+      ROW({"k", "a0", "a1", "window_end"},
+          {BIGINT(), BIGINT(), BIGINT(), BIGINT()});
+  auto aggregator = makeAggregator(
+      makeGlobalNode(
+          partialType,
+          ROW({"k", "w_start", "w_end", "s", "c"},
+              {BIGINT(), TIMESTAMP(), TIMESTAMP(), BIGINT(), BIGINT()}),
+          5000,
+          0,
+          1,
+          3),
+      std::move(capture));
+
+  // Two partials for the same (k=1, slice [0,5000)): the global merges
+  // them into one window state, fires once with the combined sum.
+  aggregator->addInput(
+      partialRecord2({1, 1}, {10, 5}, {1, 1}, {5000, 5000}));
+  aggregator->advance();
+  // A second key in the same slice.
+  aggregator->addInput(partialRecord2({2}, {7}, {1}, {5000}));
+  aggregator->advance();
+  aggregator->processWatermark(5999);
+
+  ASSERT_EQ(capturePtr->records().size(), 2);
+  for (const auto& out : capturePtr->records()) {
+    const auto key = out->childAt(0)->asFlatVector<int64_t>()->valueAt(0);
+    const auto start =
+        out->childAt(1)->asFlatVector<Timestamp>()->valueAt(0).toMillis();
+    const auto end =
+        out->childAt(2)->asFlatVector<Timestamp>()->valueAt(0).toMillis();
+    const auto sum = out->childAt(3)->asFlatVector<int64_t>()->valueAt(0);
+    const auto cnt = out->childAt(4)->asFlatVector<int64_t>()->valueAt(0);
+    EXPECT_EQ(start, 0);
+    EXPECT_EQ(end, 5000);
+    if (key == 1) {
+      EXPECT_EQ(sum, 15);
+      EXPECT_EQ(cnt, 2);
+    } else {
+      EXPECT_EQ(key, 2);
+      EXPECT_EQ(sum, 7);
+      EXPECT_EQ(cnt, 1);
+    }
+  }
+  aggregator->close();
+}
+
+// L4 M2: HOP partials merge across slices - the fire heap-merges the
+// covered slices' states exactly as in the single-stage path.
+TEST_F(WindowAggregatorTest, testGlobalHopPartials) {
+  auto capture = std::make_unique<CaptureTarget>(driverCtx_.get(), nextNodeId());
+  auto* capturePtr = capture.get();
+  const auto partialType =
+      ROW({"k", "a0", "a1", "window_end"},
+          {BIGINT(), BIGINT(), BIGINT(), BIGINT()});
+  auto aggregator = makeAggregator(
+      makeGlobalNode(
+          partialType,
+          ROW({"k", "w_start", "w_end", "s", "c"},
+              {BIGINT(), TIMESTAMP(), TIMESTAMP(), BIGINT(), BIGINT()}),
+          4000,
+          2000,
+          0,
+          3),
+      std::move(capture));
+
+  // Slice 2000 carries sum 30, slice 4000 carries sum 20; the window
+  // [-2000, 2000) fires from slice 2000 only, [0, 4000) merges both.
+  aggregator->addInput(
+      partialRecord2({1, 1, 1}, {10, 20, 10}, {1, 2, 1}, {2000, 2000, 4000}));
+  aggregator->advance();
+  aggregator->processWatermark(2000);
+  aggregator->processWatermark(4000);
+
+  ASSERT_EQ(capturePtr->records().size(), 2);
+  const auto first = capturePtr->records()[0];
+  EXPECT_EQ(
+      first->childAt(1)->asFlatVector<Timestamp>()->valueAt(0).toMillis(),
+      -2000);
+  EXPECT_EQ(
+      first->childAt(2)->asFlatVector<Timestamp>()->valueAt(0).toMillis(),
+      2000);
+  EXPECT_EQ(first->childAt(3)->asFlatVector<int64_t>()->valueAt(0), 30);
+  const auto second = capturePtr->records()[1];
+  EXPECT_EQ(
+      second->childAt(1)->asFlatVector<Timestamp>()->valueAt(0).toMillis(),
+      0);
+  EXPECT_EQ(
+      second->childAt(2)->asFlatVector<Timestamp>()->valueAt(0).toMillis(),
+      4000);
+  EXPECT_EQ(second->childAt(3)->asFlatVector<int64_t>()->valueAt(0), 40);
   aggregator->close();
 }
 

@@ -60,8 +60,8 @@ namespace facebook::velox::stateful {
 /// Limitations (fail loud): append-only input only (a non-+I rowKind
 /// fails at runtime, L2; gluten rejects needRetraction at translation
 /// time); DISTINCT/sorted aggregates are rejected by makeAggregateInfos
-/// (L1); CUMULATE/SESSION windows are rejected at operator init (L5,
-/// TODO: separate follow-up task) — they must not silently run the
+/// (L1); CUMULATE windows are rejected at operator init (L5, TODO:
+/// separate follow-up task) — they must not silently run the
 /// TUMBLE logic.
 class WindowAggregator : public StatefulOperator {
  public:
@@ -198,6 +198,13 @@ class WindowAggregator : public StatefulOperator {
       const RowContainerStateKey& key,
       int64_t windowEnd);
 
+  /// The two-stage global advance: input is the local partials
+  /// [keys, intermediates, windowEnd]; the slice end comes from the
+  /// attached column and intermediates merge via
+  /// addIntermediateResults. Separate from the single-stage advance()
+  /// so the raw accumulation path keeps its codegen (W1 lesson).
+  void advancePartialInput();
+
   /// SESSION advance: per row opens [ts, ts+gap), merges intersecting
   /// in-flight windows (accumulators pinned to the surviving state
   /// window, Flink MergingWindowSet), accumulates into that state
@@ -311,6 +318,13 @@ class WindowAggregator : public StatefulOperator {
   /// -1 when the query carries no count star; hopping windows require
   /// one (Flink checkArgument in WindowIsEmptySupplier).
   int32_t countStarIndex_ = -1;
+
+  /// The two-stage global side: the input is the partial row [keys,
+  /// intermediates, windowEnd] (keyless: [intermediates, windowEnd]
+  /// plus the wrapped "$keyless_key" appended after windowEnd) and the
+  /// accumulation merges intermediate columns into the state rows
+  /// (kFinal step) instead of accumulating raw input (kSingle).
+  bool isPartialInput_ = false;
   /// Accumulator-row offset of the count star column (set during the
   /// setOffsets wiring); the count accumulator is a never-null inline
   /// int64 (SimpleNumericAggregate<bool, int64_t, int64_t>), so a raw

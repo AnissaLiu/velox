@@ -74,15 +74,16 @@ SliceAssigner::SliceAssigner(
     int64_t offset,
     WindowType windowType,
     int rowtimeIndex,
-    const tzdb::time_zone* shiftTimeZone)
+    const tzdb::time_zone* shiftTimeZone,
+    bool attached)
     : keySelector_(std::move(keySelector)),
       size_(size),
       step_(step),
       offset_(offset),
       windowType_(windowType),
       rowtimeIndex_(rowtimeIndex),
-      shiftTimeZone_(shiftTimeZone) {
-  // TODO: calculate sliceSize_ based on windowType.
+      shiftTimeZone_(shiftTimeZone),
+      attached_(attached) {
   // Calculate sliceSize based on windowType (matching Flink SliceAssigners):
   // TUMBLE -> size, HOP -> gcd(size, step), CUMULATE -> step, SESSION -> N/A.
   switch (windowType_) {
@@ -133,7 +134,39 @@ std::map<int64_t, RowVectorPtr> SliceAssigner::assignSliceEnd(
         tsSimple != nullptr || tsSimpleInt != nullptr,
         "rowtime column must be TIMESTAMP/Int64 simple vector");
 
+    velox::memory::MemoryPool* pool = input->pool();
+    std::map<int64_t, RowVectorPtr> sliceEndToData;
     const vector_size_t numRows = rowtimeVector->size();
+
+    if (attached_) {
+      // The two-stage global side: the column carries the slice end
+      // the local stage assigned (BIGINT windowEnd appended by the
+      // local pre-aggregation; SliceAttachedWindowingStrategy).
+      VELOX_CHECK(
+          tsSimpleInt != nullptr,
+          "The attached slice-end column must be a BIGINT simple vector, got {}",
+          rowtimeVector->typeKind());
+      std::unordered_map<int64_t, std::vector<vector_size_t>> groups;
+      for (vector_size_t i = 0; i < numRows; ++i) {
+        VELOX_CHECK(
+            !(tsSimple ? tsSimple->isNullAt(i) : tsSimpleInt->isNullAt(i)),
+            "RowTime field should not be null");
+        groups[tsSimpleInt->valueAt(i)].push_back(i);
+      }
+      for (const auto& [sliceEnd, rowIndices] : groups) {
+        const vector_size_t n = rowIndices.size();
+        BufferPtr indicesBuf = allocateIndices(n, pool);
+        auto* raw = indicesBuf->asMutable<vector_size_t>();
+        for (vector_size_t j = 0; j < n; ++j) {
+          raw[j] = rowIndices[j];
+        }
+        sliceEndToData.emplace(
+            sliceEnd,
+            wrapChildrenByIndices(input, n, indicesBuf, pool));
+      }
+      return sliceEndToData;
+    }
+
     auto isNullAtRow = [&](vector_size_t row) {
       return tsSimple ? tsSimple->isNullAt(row) : tsSimpleInt->isNullAt(row);
     };
@@ -141,9 +174,6 @@ std::map<int64_t, RowVectorPtr> SliceAssigner::assignSliceEnd(
       return tsSimple ? tsSimple->valueAt(row).toMillis()
                       : tsSimpleInt->valueAt(row);
     };
-
-    velox::memory::MemoryPool* pool = input->pool();
-    std::map<int64_t, RowVectorPtr> sliceEndToData;
 
     if (windowType_ == WindowType::TUMBLE) {
       std::unordered_map<int64_t, std::vector<vector_size_t>> groups;
