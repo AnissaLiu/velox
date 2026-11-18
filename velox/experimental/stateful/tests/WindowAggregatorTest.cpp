@@ -763,6 +763,87 @@ TEST_F(WindowAggregatorTest, testSessionBoundaryTouchMerges) {
       30);
 }
 
+// SESSION out-of-order merge into a NON-tail window: the row's window
+// intersects the floor window while the tail stays disjoint - the
+// general ceiling/floor path (the in-order fast path does not apply).
+TEST_F(WindowAggregatorTest, testSessionOutOfOrderMergesIntoFloorWindow) {
+  auto capture =
+      std::make_unique<CaptureTarget>(driverCtx_.get(), nextNodeId());
+  auto* capturePtr = capture.get();
+  auto aggregator = makeAggregator(
+      makeNode({countStarOfC(), sumOfC()}, /*size=gap=*/2000, /*step=*/0, kSession),
+      std::move(capture));
+
+  // Two disjoint sessions; the late row lands between them, merging
+  // into the FIRST (floor) only.
+  aggregator->addInput(windowRecord({1, 1}, {1000, 5000}, {10, 20}));
+  aggregator->advance();
+  aggregator->addInput(windowRecord({1}, {2500}, {30}));
+  aggregator->advance();
+  // A swallowed out-of-order duplicate: window [2000,4000) falls
+  // inside the merged [1000,4500) - no state, mapping or fire change.
+  aggregator->addInput(windowRecord({1}, {2000}, {5}));
+  aggregator->advance();
+  aggregator->processWatermark(9000);
+
+  ASSERT_EQ(capturePtr->records().size(), 2);
+  EXPECT_EQ(
+      capturePtr->records()[0]->childAt(1)->asFlatVector<Timestamp>()->valueAt(0),
+      Timestamp::fromMillis(1000));
+  EXPECT_EQ(
+      capturePtr->records()[0]->childAt(2)->asFlatVector<Timestamp>()->valueAt(0),
+      Timestamp::fromMillis(4500));
+  EXPECT_EQ(
+      capturePtr->records()[0]->childAt(3)->asFlatVector<int64_t>()->valueAt(0),
+      3);
+  EXPECT_EQ(
+      capturePtr->records()[0]->childAt(4)->asFlatVector<int64_t>()->valueAt(0),
+      45);
+  EXPECT_EQ(
+      capturePtr->records()[1]->childAt(1)->asFlatVector<Timestamp>()->valueAt(0),
+      Timestamp::fromMillis(5000));
+  EXPECT_EQ(
+      capturePtr->records()[1]->childAt(2)->asFlatVector<Timestamp>()->valueAt(0),
+      Timestamp::fromMillis(7000));
+  EXPECT_EQ(
+      capturePtr->records()[1]->childAt(4)->asFlatVector<int64_t>()->valueAt(0),
+      20);
+}
+
+// SESSION bridge merge: the row's window touches BOTH in-flight windows
+// on its inclusive bounds - the cover swallows them into one session.
+TEST_F(WindowAggregatorTest, testSessionBridgeMergesBothWindows) {
+  auto capture =
+      std::make_unique<CaptureTarget>(driverCtx_.get(), nextNodeId());
+  auto* capturePtr = capture.get();
+  auto aggregator = makeAggregator(
+      makeNode({countStarOfC(), sumOfC()}, /*size=gap=*/2000, /*step=*/0, kSession),
+      std::move(capture));
+
+  aggregator->addInput(windowRecord({1, 1}, {1000, 5000}, {10, 20}));
+  aggregator->advance();
+  // [3000,5000) touches [1000,3000) at 3000 and [5000,7000) at 5000 -
+  // both inclusive bounds merge; the ceiling merges first (cover
+  // [3000,7000)), then the floor check runs against the COVER.
+  aggregator->addInput(windowRecord({1}, {3000}, {30}));
+  aggregator->advance();
+  aggregator->processWatermark(9000);
+
+  ASSERT_EQ(capturePtr->records().size(), 1);
+  EXPECT_EQ(
+      capturePtr->records()[0]->childAt(1)->asFlatVector<Timestamp>()->valueAt(0),
+      Timestamp::fromMillis(1000));
+  EXPECT_EQ(
+      capturePtr->records()[0]->childAt(2)->asFlatVector<Timestamp>()->valueAt(0),
+      Timestamp::fromMillis(7000));
+  EXPECT_EQ(
+      capturePtr->records()[0]->childAt(3)->asFlatVector<int64_t>()->valueAt(0),
+      3);
+  EXPECT_EQ(
+      capturePtr->records()[0]->childAt(4)->asFlatVector<int64_t>()->valueAt(0),
+      60);
+}
+
 // FILTER masks reach the window aggregation exactly as in group
 // aggregation, and multiple aggregates over one input share the batch.
 TEST_F(WindowAggregatorTest, testFilterMaskAndMultipleAggregates) {
