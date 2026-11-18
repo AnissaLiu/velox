@@ -352,6 +352,7 @@ class WindowAggregatorTest : public exec::test::OperatorTestBase {
 
   static constexpr int64_t kTumble = 1;
   static constexpr int64_t kHop = 0;
+  static constexpr int64_t kSession = 2;
 
   std::string nextNodeId() {
     return "node_" + std::to_string(nextNodeId_++);
@@ -627,6 +628,141 @@ TEST_F(WindowAggregatorTest, testHopLatePartialAccumulatesIntoUnfiredWindow) {
       Timestamp::fromMillis(0));
 }
 
+
+
+
+
+
+// SESSION core: two rows closer than the gap merge into one cover
+// window; the fire entry re-hangs to the merged end so the interior
+// end never emits (Flink MergingWindowSet + trigger clear on merge).
+TEST_F(WindowAggregatorTest, testSessionAdjacentMergeAndTrigger) {
+  auto capture =
+      std::make_unique<CaptureTarget>(driverCtx_.get(), nextNodeId());
+  auto* capturePtr = capture.get();
+  auto aggregator = makeAggregator(
+      makeNode({countStarOfC(), sumOfC()}, /*size=gap=*/2000, /*step=*/0, kSession),
+      std::move(capture));
+
+  aggregator->addInput(windowRecord({1}, {1000}, {10}));
+  aggregator->advance();
+  // Past the first row's window end [1000,3000) is not yet due at 2500
+  // (dueTs 2999); the merge must still re-hang the entry to 4500.
+  aggregator->processWatermark(2500);
+  aggregator->addInput(windowRecord({1}, {2500}, {20}));
+  aggregator->advance();
+  aggregator->processWatermark(3000);
+  aggregator->processWatermark(4500);
+
+  // The merged window [1000,4500) fires once at its own end.
+  ASSERT_EQ(capturePtr->records().size(), 1);
+  EXPECT_EQ(
+      capturePtr->records()[0]->childAt(1)->asFlatVector<Timestamp>()->valueAt(0),
+      Timestamp::fromMillis(1000));
+  EXPECT_EQ(
+      capturePtr->records()[0]->childAt(2)->asFlatVector<Timestamp>()->valueAt(0),
+      Timestamp::fromMillis(4500));
+  EXPECT_EQ(
+      capturePtr->records()[0]->childAt(3)->asFlatVector<int64_t>()->valueAt(0),
+      2);
+  EXPECT_EQ(
+      capturePtr->records()[0]->childAt(4)->asFlatVector<int64_t>()->valueAt(0),
+      30);
+}
+
+// SESSION boundary: rows farther apart than the gap never merge - two
+// independent windows fire at their own ends.
+TEST_F(WindowAggregatorTest, testSessionDisjointWindowsFireIndependently) {
+  auto capture =
+      std::make_unique<CaptureTarget>(driverCtx_.get(), nextNodeId());
+  auto* capturePtr = capture.get();
+  auto aggregator = makeAggregator(
+      makeNode({countStarOfC(), sumOfC()}, /*size=gap=*/2000, /*step=*/0, kSession),
+      std::move(capture));
+
+  aggregator->addInput(windowRecord({1, 1}, {1000, 5000}, {10, 20}));
+  aggregator->advance();
+  aggregator->processWatermark(3000);
+  aggregator->processWatermark(7000);
+
+  ASSERT_EQ(capturePtr->records().size(), 2);
+  EXPECT_EQ(
+      capturePtr->records()[0]->childAt(1)->asFlatVector<Timestamp>()->valueAt(0),
+      Timestamp::fromMillis(1000));
+  EXPECT_EQ(
+      capturePtr->records()[0]->childAt(2)->asFlatVector<Timestamp>()->valueAt(0),
+      Timestamp::fromMillis(3000));
+  EXPECT_EQ(
+      capturePtr->records()[0]->childAt(4)->asFlatVector<int64_t>()->valueAt(0),
+      10);
+  EXPECT_EQ(
+      capturePtr->records()[1]->childAt(1)->asFlatVector<Timestamp>()->valueAt(0),
+      Timestamp::fromMillis(5000));
+  EXPECT_EQ(
+      capturePtr->records()[1]->childAt(2)->asFlatVector<Timestamp>()->valueAt(0),
+      Timestamp::fromMillis(7000));
+  EXPECT_EQ(
+      capturePtr->records()[1]->childAt(4)->asFlatVector<int64_t>()->valueAt(0),
+      20);
+}
+
+// SESSION late rows: a window whose end is already behind the progress
+// is retired and the row dropped - no state residue, no emission
+// (Flink isWindowLate + retireWindow; TVF allowedLateness = 0).
+TEST_F(WindowAggregatorTest, testSessionLateRowRetiredAndDropped) {
+  auto capture =
+      std::make_unique<CaptureTarget>(driverCtx_.get(), nextNodeId());
+  auto* capturePtr = capture.get();
+  auto aggregator = makeAggregator(
+      makeNode({countStarOfC(), sumOfC()}, /*size=gap=*/2000, /*step=*/0, kSession),
+      std::move(capture));
+
+  aggregator->addInput(windowRecord({1}, {1000}, {10}));
+  aggregator->advance();
+  aggregator->processWatermark(3500);
+  ASSERT_EQ(capturePtr->records().size(), 1);
+
+  // ts=1000 opens [1000,3000): maxTimestamp 2999 <= progress 3500 -
+  // late, retired, dropped.
+  aggregator->addInput(windowRecord({1}, {1000}, {5}));
+  aggregator->advance();
+  EXPECT_EQ(aggregator->lateDroppedRows(), 1);
+  aggregator->processWatermark(6000);
+  EXPECT_EQ(capturePtr->records().size(), 1);
+}
+
+// SESSION boundary: sessions split only when the row interval EXCEEDS
+// the gap - Flink's TimeWindow#intersects is inclusive on both bounds,
+// so an interval exactly equal to the gap still merges (native-verified).
+TEST_F(WindowAggregatorTest, testSessionBoundaryTouchMerges) {
+  auto capture =
+      std::make_unique<CaptureTarget>(driverCtx_.get(), nextNodeId());
+  auto* capturePtr = capture.get();
+  auto aggregator = makeAggregator(
+      makeNode({countStarOfC(), sumOfC()}, /*size=gap=*/2000, /*step=*/0, kSession),
+      std::move(capture));
+
+  // ts=1000 opens [1000,3000); ts=3000 opens [3000,5000) - touching at
+  // 3000: one merged session [1000,5000).
+  aggregator->addInput(windowRecord({1, 1}, {1000, 3000}, {10, 20}));
+  aggregator->advance();
+  aggregator->processWatermark(5000);
+
+  ASSERT_EQ(capturePtr->records().size(), 1);
+  EXPECT_EQ(
+      capturePtr->records()[0]->childAt(1)->asFlatVector<Timestamp>()->valueAt(0),
+      Timestamp::fromMillis(1000));
+  EXPECT_EQ(
+      capturePtr->records()[0]->childAt(2)->asFlatVector<Timestamp>()->valueAt(0),
+      Timestamp::fromMillis(5000));
+  EXPECT_EQ(
+      capturePtr->records()[0]->childAt(3)->asFlatVector<int64_t>()->valueAt(0),
+      2);
+  EXPECT_EQ(
+      capturePtr->records()[0]->childAt(4)->asFlatVector<int64_t>()->valueAt(0),
+      30);
+}
+
 // FILTER masks reach the window aggregation exactly as in group
 // aggregation, and multiple aggregates over one input share the batch.
 TEST_F(WindowAggregatorTest, testFilterMaskAndMultipleAggregates) {
@@ -880,6 +1016,55 @@ TEST_F(WindowAggregatorTest, testSnapshotRestoreRebuildsFireIndex) {
       6);
 }
 
+
+// SESSION restore: the rebuilt fire entry carries the ACTUAL (merged)
+// window from the mapping, not the pinned state window - the merged
+// range fires as one at its own end, and post-restore rows merge and
+// retire against the restored mapping.
+TEST_F(WindowAggregatorTest, testSessionSnapshotRestore) {
+  auto captureA =
+      std::make_unique<CaptureTarget>(driverCtx_.get(), nextNodeId());
+  auto aggregatorA = makeAggregator(
+      makeNode({sumOfC()}, 2000, 0, kSession), std::move(captureA));
+  aggregatorA->addInput(windowRecord({1, 1}, {1000, 2500}, {10, 20}));
+  aggregatorA->advance();
+  const auto bytes = aggregatorA->keyedStateBackend().snapshot();
+
+  auto capture =
+      std::make_unique<CaptureTarget>(driverCtx_.get(), nextNodeId());
+  auto* capturePtr = capture.get();
+  auto aggregatorB = makeAggregator(
+      makeNode({sumOfC()}, 2000, 0, kSession), std::move(capture));
+  aggregatorB->keyedStateBackend().restore(bytes);
+  aggregatorB->rebuildFireIndex();
+
+  // The merged window [1000,4500) fires at 4500 with the full range -
+  // NOT at the state window's end 3000.
+  aggregatorB->processWatermark(4500);
+  ASSERT_EQ(capturePtr->records().size(), 1);
+  EXPECT_EQ(
+      capturePtr->records()[0]->childAt(1)->asFlatVector<Timestamp>()->valueAt(0),
+      Timestamp::fromMillis(1000));
+  EXPECT_EQ(
+      capturePtr->records()[0]->childAt(2)->asFlatVector<Timestamp>()->valueAt(0),
+      Timestamp::fromMillis(4500));
+  EXPECT_EQ(
+      capturePtr->records()[0]->childAt(3)->asFlatVector<int64_t>()->valueAt(0),
+      30);
+
+  // Post-restore rows open fresh windows against the retired mapping.
+  aggregatorB->addInput(windowRecord({1}, {5000}, {5}));
+  aggregatorB->advance();
+  aggregatorB->processWatermark(7000);
+  ASSERT_EQ(capturePtr->records().size(), 2);
+  EXPECT_EQ(
+      capturePtr->records()[1]->childAt(1)->asFlatVector<Timestamp>()->valueAt(0),
+      Timestamp::fromMillis(5000));
+  EXPECT_EQ(
+      capturePtr->records()[1]->childAt(3)->asFlatVector<int64_t>()->valueAt(0),
+      5);
+}
+
 // A shift timezone moves the window grid: Asia/Shanghai is a fixed +8
 // offset, so epoch 0 (1970-01-01 08:00 wall clock) opens the window
 // [08:00, 09:00) in shifted millis, emitted as window_start = 28800000.
@@ -941,18 +1126,23 @@ TEST_F(WindowAggregatorTest, testNullRowtimeFailsLoud) {
   VELOX_ASSERT_THROW(aggregator->advance(), "RowTime field should not be null");
 }
 
-// Fail loud: CUMULATE and SESSION are rejected at operator init (L5) -
-// they must not silently run the TUMBLE logic.
-TEST_F(WindowAggregatorTest, testUnsupportedWindowTypesFailLoud) {
-  for (int windowType : {2 /* SESSION */, 3 /* CUMULATIVE */}) {
-    auto node = makeNode({sumOfC()}, 5000, 0, windowType);
-    std::vector<StatefulOperatorPtr> targets;
-    targets.push_back(
-        std::make_unique<CaptureTarget>(driverCtx_.get(), nextNodeId()));
-    auto aggregator = std::make_unique<WindowAggregator>(
-        nullptr, std::move(targets), node, driverCtx_.get());
-    VELOX_ASSERT_THROW(aggregator->initialize(), "L5");
-  }
+// L5 lifted for SESSION; CUMULATE stays deferred (preserved on the
+// window-agg-cumulate-deferred branch) and must keep failing loud.
+TEST_F(WindowAggregatorTest, testSessionInitializeAndCumulateDeferred) {
+  auto aggregator = makeAggregator(
+      makeNode({countStarOfC(), sumOfC()}, /*size=gap=*/2000, /*step=*/0, kSession),
+      std::make_unique<CaptureTarget>(driverCtx_.get(), nextNodeId()));
+  aggregator->addInput(windowRecord({1}, {1000}, {7}));
+  aggregator->advance();
+  aggregator->processWatermark(6000);
+
+  auto node = makeNode({sumOfC()}, 4000, 2000, 3 /* CUMULATIVE */);
+  std::vector<StatefulOperatorPtr> targets;
+  targets.push_back(
+      std::make_unique<CaptureTarget>(driverCtx_.get(), nextNodeId()));
+  auto rejected = std::make_unique<WindowAggregator>(
+      nullptr, std::move(targets), node, driverCtx_.get());
+  VELOX_ASSERT_THROW(rejected->initialize(), "CUMULATE");
 }
 
 // Fail loud: DISTINCT and sorted aggregates are rejected by
