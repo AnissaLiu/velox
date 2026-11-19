@@ -342,6 +342,124 @@ class WindowAggregatorTest : public exec::test::OperatorTestBase {
         /*windowEndIndex=*/-1);
   }
 
+  // Keyless local node: no grouping keys; gluten appends the constant
+  // "$keyless_key" to the DECLARED input (runtime batches are one
+  // column narrower and get wrapped in addInput); the local output
+  // carries NO key column (Flink local layout [accs, windowEnd]).
+  std::shared_ptr<const StreamWindowAggregationNode> makeLocalKeylessNode(
+      const std::vector<core::AggregationNode::Aggregate>& aggregates,
+      const RowTypePtr& partialRowType,
+      int64_t size,
+      int64_t step,
+      int windowType) {
+    const auto id = nextNodeId();
+    const auto inputType = ROW(
+        {"ts", "c", "$keyless_key"},
+        {TIMESTAMP(), BIGINT(), BIGINT()});
+    std::vector<std::string> aggNames;
+    for (size_t i = 0; i < aggregates.size(); ++i) {
+      aggNames.push_back("a" + std::to_string(i));
+    }
+    auto aggregation = std::make_shared<const core::AggregationNode>(
+        core::PlanNodeId{id + "-agg"},
+        core::AggregationNode::Step::kPartial,
+        std::vector<core::FieldAccessTypedExprPtr>{},
+        std::vector<core::FieldAccessTypedExprPtr>{},
+        aggNames,
+        aggregates,
+        false,
+        std::make_shared<stateful::EmptyNode>(inputType));
+    auto keyedStateSpec = std::make_shared<KeyedStateSpec>(
+        std::vector<column_index_t>{2}, std::vector<TypePtr>{BIGINT()});
+    std::shared_ptr<const core::AggregationNode> noLocalAgg;
+    return std::make_shared<const StreamWindowAggregationNode>(
+        core::PlanNodeId{id},
+        aggregation,
+        noLocalAgg,
+        std::make_shared<exec::HashPartitionFunctionSpec>(
+            inputType,
+            std::vector<column_index_t>{2}),
+        std::make_shared<stateful::StreamWindowPartitionFunctionSpec>(
+            inputType,
+            1,
+            size,
+            step,
+            0,
+            static_cast<WindowType>(windowType)),
+        keyedStateSpec,
+        /*shiftTimeZone=*/"",
+        /*isLocalAgg=*/true,
+        size,
+        step,
+        /*offset=*/0,
+        windowType,
+        partialRowType,
+        /*isEventTime=*/true,
+        /*rowtimeIndex=*/1,
+        /*windowStartIndex=*/-1,
+        /*windowEndIndex=*/-1);
+  }
+
+  // Keyless global node: the declared input carries the wrapped
+  // "$keyless_key" appended AFTER windowEnd ([intermediates,
+  // windowEnd, $keyless_key]); the runtime partials are one column
+  // narrower and get wrapped in addInput; the output is the Flink
+  // keyless global layout [aggregates, w_start, w_end].
+  std::shared_ptr<const StreamWindowAggregationNode> makeGlobalKeylessNode(
+      const RowTypePtr& partialInputType,
+      const RowTypePtr& outputType,
+      int64_t size,
+      int64_t step,
+      int windowType,
+      int rowtimeIndex,
+      int windowStartIndex,
+      int windowEndIndex,
+      column_index_t keylessChannel) {
+    const auto id = nextNodeId();
+    std::vector<core::AggregationNode::Aggregate> aggregates{sumOfC(), countStarOfC()};
+    aggregates[0].rawInputTypes = {BIGINT()};
+    aggregates[1].rawInputTypes = {};
+    std::vector<std::string> aggNames{"a0", "a1"};
+    auto aggregation = std::make_shared<const core::AggregationNode>(
+        core::PlanNodeId{id + "-agg"},
+        core::AggregationNode::Step::kFinal,
+        std::vector<core::FieldAccessTypedExprPtr>{},
+        std::vector<core::FieldAccessTypedExprPtr>{},
+        aggNames,
+        aggregates,
+        false,
+        std::make_shared<stateful::EmptyNode>(partialInputType));
+    auto keyedStateSpec = std::make_shared<KeyedStateSpec>(
+        std::vector<column_index_t>{keylessChannel},
+        std::vector<TypePtr>{BIGINT()});
+    std::shared_ptr<const core::AggregationNode> noLocalAgg;
+    return std::make_shared<const StreamWindowAggregationNode>(
+        core::PlanNodeId{id},
+        aggregation,
+        noLocalAgg,
+        std::make_shared<exec::HashPartitionFunctionSpec>(
+            partialInputType, std::vector<column_index_t>{keylessChannel}),
+        std::make_shared<stateful::StreamWindowPartitionFunctionSpec>(
+            partialInputType,
+            rowtimeIndex,
+            size,
+            step,
+            0,
+            static_cast<WindowType>(windowType)),
+        keyedStateSpec,
+        /*shiftTimeZone=*/"",
+        /*isLocalAgg=*/false,
+        size,
+        step,
+        /*offset=*/0,
+        windowType,
+        outputType,
+        /*isEventTime=*/true,
+        rowtimeIndex,
+        windowStartIndex,
+        windowEndIndex);
+  }
+
   std::unique_ptr<LocalWindowAggregator> makeLocalAggregator(
       const std::shared_ptr<const StreamWindowAggregationNode>& node,
       std::unique_ptr<StatefulOperator> capture) {
@@ -363,14 +481,19 @@ class WindowAggregatorTest : public exec::test::OperatorTestBase {
   }
 
   // The global kFinal node: input = the partial row [k, intermediate,
-  // windowEnd], output = [k, w_start, w_end, final].
+  // windowEnd], output = the Flink global layout [k, aggregates,
+  // w_start, w_end] with the REAL windowStartIndex/windowEndIndex the
+  // shadow carries (getWindowStartAndEndIndexes) - pins the production
+  // emit layout, not the -1 legacy fallback.
   std::shared_ptr<const StreamWindowAggregationNode> makeGlobalNode(
       const RowTypePtr& partialInputType,
       const RowTypePtr& outputType,
       int64_t size,
       int64_t step,
       int windowType,
-      int rowtimeIndex) {
+      int rowtimeIndex,
+      int windowStartIndex,
+      int windowEndIndex) {
     const auto id = nextNodeId();
     std::vector<core::FieldAccessTypedExprPtr> groupingKeys;
     groupingKeys.push_back(std::make_shared<core::FieldAccessTypedExpr>(
@@ -411,8 +534,8 @@ class WindowAggregatorTest : public exec::test::OperatorTestBase {
         outputType,
         /*isEventTime=*/true,
         rowtimeIndex,
-        /*windowStartIndex=*/-1,
-        /*windowEndIndex=*/-1);
+        windowStartIndex,
+        windowEndIndex);
   }
 
   StreamElementPtr partialRecord2(
@@ -428,6 +551,40 @@ class WindowAggregatorTest : public exec::test::OperatorTestBase {
              makeFlatVector<int64_t>(partialValue),
              makeFlatVector<int64_t>(partialCount),
              makeFlatVector<int64_t>(windowEnd)}));
+  }
+
+  // Keyless runtime partials: NO key column and NO wrapped
+  // "$keyless_key" - the C++ wraps the constant column in addInput
+  // (the declared type is one column wider than the runtime batches).
+  StreamElementPtr keylessPartialRecord2(
+      const std::vector<int64_t>& partialValue,
+      const std::vector<int64_t>& partialCount,
+      const std::vector<int64_t>& windowEnd) {
+    return std::make_shared<StreamRecord>(
+        "window-agg",
+        makeRowVector(
+            {"a0", "a1", "window_end"},
+            {makeFlatVector<int64_t>(partialValue),
+             makeFlatVector<int64_t>(partialCount),
+             makeFlatVector<int64_t>(windowEnd)}));
+  }
+
+  // Keyless raw input: [ts, c] - two columns only (the declared type
+  // carries the appended "$keyless_key").
+  StreamElementPtr keylessWindowRecord(
+      const std::vector<int64_t>& tsMillis,
+      const std::vector<int64_t>& c) {
+    std::vector<Timestamp> ts;
+    ts.reserve(tsMillis.size());
+    for (auto ms : tsMillis) {
+      ts.push_back(Timestamp::fromMillis(ms));
+    }
+    return std::make_shared<StreamRecord>(
+        "window-agg",
+        makeRowVector({"ts", "c"}, {
+                                       makeFlatVector<Timestamp>(ts),
+                                       makeFlatVector<int64_t>(c),
+                                   }));
   }
 
   StreamElementPtr partialRecord(
@@ -1239,12 +1396,16 @@ TEST_F(WindowAggregatorTest, testGlobalConsumesPartials) {
   auto aggregator = makeAggregator(
       makeGlobalNode(
           partialType,
-          ROW({"k", "w_start", "w_end", "s", "c"},
-              {BIGINT(), TIMESTAMP(), TIMESTAMP(), BIGINT(), BIGINT()}),
+          // The Flink global layout [keys, aggregates, w_start, w_end]
+          // with the REAL window column positions the shadow carries.
+          ROW({"k", "s", "c", "w_start", "w_end"},
+              {BIGINT(), BIGINT(), BIGINT(), TIMESTAMP(), TIMESTAMP()}),
           5000,
           0,
           1,
-          3),
+          3,
+          3,
+          4),
       std::move(capture));
 
   // Two partials for the same (k=1, slice [0,5000)): the global merges
@@ -1261,11 +1422,11 @@ TEST_F(WindowAggregatorTest, testGlobalConsumesPartials) {
   for (const auto& out : capturePtr->records()) {
     const auto key = out->childAt(0)->asFlatVector<int64_t>()->valueAt(0);
     const auto start =
-        out->childAt(1)->asFlatVector<Timestamp>()->valueAt(0).toMillis();
+        out->childAt(3)->asFlatVector<Timestamp>()->valueAt(0).toMillis();
     const auto end =
-        out->childAt(2)->asFlatVector<Timestamp>()->valueAt(0).toMillis();
-    const auto sum = out->childAt(3)->asFlatVector<int64_t>()->valueAt(0);
-    const auto cnt = out->childAt(4)->asFlatVector<int64_t>()->valueAt(0);
+        out->childAt(4)->asFlatVector<Timestamp>()->valueAt(0).toMillis();
+    const auto sum = out->childAt(1)->asFlatVector<int64_t>()->valueAt(0);
+    const auto cnt = out->childAt(2)->asFlatVector<int64_t>()->valueAt(0);
     EXPECT_EQ(start, 0);
     EXPECT_EQ(end, 5000);
     if (key == 1) {
@@ -1291,12 +1452,15 @@ TEST_F(WindowAggregatorTest, testGlobalHopPartials) {
   auto aggregator = makeAggregator(
       makeGlobalNode(
           partialType,
-          ROW({"k", "w_start", "w_end", "s", "c"},
-              {BIGINT(), TIMESTAMP(), TIMESTAMP(), BIGINT(), BIGINT()}),
+          // The Flink global layout [keys, aggregates, w_start, w_end].
+          ROW({"k", "s", "c", "w_start", "w_end"},
+              {BIGINT(), BIGINT(), BIGINT(), TIMESTAMP(), TIMESTAMP()}),
           4000,
           2000,
           0,
-          3),
+          3,
+          3,
+          4),
       std::move(capture));
 
   // Slice 2000 carries sum 30, slice 4000 carries sum 20; the window
@@ -1310,20 +1474,193 @@ TEST_F(WindowAggregatorTest, testGlobalHopPartials) {
   ASSERT_EQ(capturePtr->records().size(), 2);
   const auto first = capturePtr->records()[0];
   EXPECT_EQ(
-      first->childAt(1)->asFlatVector<Timestamp>()->valueAt(0).toMillis(),
+      first->childAt(3)->asFlatVector<Timestamp>()->valueAt(0).toMillis(),
       -2000);
   EXPECT_EQ(
-      first->childAt(2)->asFlatVector<Timestamp>()->valueAt(0).toMillis(),
+      first->childAt(4)->asFlatVector<Timestamp>()->valueAt(0).toMillis(),
       2000);
-  EXPECT_EQ(first->childAt(3)->asFlatVector<int64_t>()->valueAt(0), 30);
+  EXPECT_EQ(first->childAt(1)->asFlatVector<int64_t>()->valueAt(0), 30);
   const auto second = capturePtr->records()[1];
   EXPECT_EQ(
-      second->childAt(1)->asFlatVector<Timestamp>()->valueAt(0).toMillis(),
+      second->childAt(3)->asFlatVector<Timestamp>()->valueAt(0).toMillis(),
       0);
   EXPECT_EQ(
-      second->childAt(2)->asFlatVector<Timestamp>()->valueAt(0).toMillis(),
+      second->childAt(4)->asFlatVector<Timestamp>()->valueAt(0).toMillis(),
       4000);
-  EXPECT_EQ(second->childAt(3)->asFlatVector<int64_t>()->valueAt(0), 40);
+  EXPECT_EQ(second->childAt(1)->asFlatVector<int64_t>()->valueAt(0), 40);
+  aggregator->close();
+}
+
+// L4 full-chain: LOCAL produces partials for the dr-3 overlapping-HOP
+// data, the GLOBAL consumes them and fires - mirrors the e2e path.
+TEST_F(WindowAggregatorTest, testTwoStageHopOverlapChain) {
+  // LOCAL stage
+  auto localCapture = std::make_unique<CaptureTarget>(
+      driverCtx_.get(), nextNodeId());
+  auto* localCapturePtr = localCapture.get();
+  auto local = makeLocalAggregator(
+      makeLocalNode(
+          {sumOfC(), countStarOfC()},
+          ROW({"k", "sum", "count", "window_end"},
+              {BIGINT(), BIGINT(), BIGINT(), BIGINT()}),
+          4000, 2000, 0),
+      std::move(localCapture));
+
+  // The dr-3 data: key=1 prices 10@1s, 20@3s, 30@5s, 40@7s; key=2 50@3.5s
+  local->addInput(
+      windowRecord({1, 1, 1, 1, 2}, {1000, 3000, 5000, 7000, 3500}, {10, 20, 30, 40, 50}));
+  local->advance();
+  local->processWatermark(9999);
+  // Read the partials BEFORE close(): close() destroys the CaptureTarget.
+  auto localPartials = localCapturePtr->records();
+  // One vectorized flush batch carrying every (key, sliceEnd) partial:
+  // k1 [0,2000)=10, k1 [2000,4000)=20, k2 [2000,4000)=50,
+  // k1 [4000,6000)=30, k1 [6000,8000)=40 (slice size = gcd(4000, 2000)).
+  ASSERT_EQ(localPartials.size(), 1);
+  ASSERT_EQ(localPartials[0]->size(), 5);
+
+  // GLOBAL stage: feed the LOCAL's partials
+  auto globalCapture = std::make_unique<CaptureTarget>(
+      driverCtx_.get(), nextNodeId());
+  auto* globalCapturePtr = globalCapture.get();
+  const auto partialType =
+      ROW({"k", "sum", "count", "window_end"},
+          {BIGINT(), BIGINT(), BIGINT(), BIGINT()});
+  auto global = makeAggregator(
+      makeGlobalNode(
+          partialType,
+          // The Flink global layout [keys, aggregates, w_start, w_end].
+          ROW({"k", "s", "c", "w_start", "w_end"},
+              {BIGINT(), BIGINT(), BIGINT(), TIMESTAMP(), TIMESTAMP()}),
+          4000, 2000, 0, 3, 3, 4),
+      std::move(globalCapture));
+
+  for (const auto& batch : localPartials) {
+    global->addInput(std::make_shared<StreamRecord>("window-agg", batch));
+    global->advance();
+  }
+  global->processWatermark(9999);
+  auto results = globalCapturePtr->records();
+  // The dr-3 data fed in ONE batch (no intermediate watermarks): no row
+  // is late, so every owning window accumulates - including k2 in
+  // [0,4000), which the e2e double-run (progressive watermarks, 2s lag)
+  // late-drops because the out-of-order 50@3500 arrives after [0,4000)
+  // fired at watermark 5000. The e2e therefore sees six windows; this
+  // single-batch chain sees all seven owning windows.
+  ASSERT_EQ(results.size(), 7);
+  std::vector<std::string> fired;
+  for (const auto& out : results) {
+    for (vector_size_t i = 0; i < out->size(); ++i) {
+      const auto key = out->childAt(0)->asFlatVector<int64_t>()->valueAt(i);
+      const auto sum = out->childAt(1)->asFlatVector<int64_t>()->valueAt(i);
+      const auto cnt = out->childAt(2)->asFlatVector<int64_t>()->valueAt(i);
+      const auto start = out->childAt(3)->asFlatVector<Timestamp>()->valueAt(i).toMillis();
+      const auto end = out->childAt(4)->asFlatVector<Timestamp>()->valueAt(i).toMillis();
+      fired.push_back(
+          "k=" + std::to_string(key) + " [" + std::to_string(start) + "," +
+          std::to_string(end) + ") sum=" + std::to_string(sum) +
+          " cnt=" + std::to_string(cnt));
+    }
+  }
+  std::sort(fired.begin(), fired.end());
+  const std::vector<std::string> expected = {
+      "k=1 [-2000,2000) sum=10 cnt=1",
+      "k=1 [0,4000) sum=30 cnt=2",
+      "k=1 [2000,6000) sum=50 cnt=2",
+      "k=1 [4000,8000) sum=70 cnt=2",
+      "k=1 [6000,10000) sum=40 cnt=1",
+      "k=2 [0,4000) sum=50 cnt=1",
+      "k=2 [2000,6000) sum=50 cnt=1"};
+  EXPECT_EQ(fired, expected);
+}
+
+// L4 keyless LOCAL: runtime batches are one column narrower than the
+// declared input (gluten appends "$keyless_key"); the wrap materializes
+// the constant key, all rows share one key row, and the flush emits the
+// Flink keyless local layout [accs, windowEnd] with NO key column.
+TEST_F(WindowAggregatorTest, testLocalKeylessWrapsAndFlushes) {
+  auto capture = std::make_unique<CaptureTarget>(driverCtx_.get(), nextNodeId());
+  auto* capturePtr = capture.get();
+  auto aggregator = makeLocalAggregator(
+      makeLocalKeylessNode(
+          {sumOfC()},
+          // The Flink keyless local output [accs, windowEnd].
+          ROW({"sum", "window_end"}, {BIGINT(), BIGINT()}),
+          5000,
+          0,
+          1),
+      std::move(capture));
+
+  // Narrow [ts, c] batches - no keyless column at runtime.
+  aggregator->addInput(keylessWindowRecord({1000, 1500}, {10, 5}));
+  aggregator->advance();
+  aggregator->addInput(keylessWindowRecord({3000}, {7}));
+  aggregator->advance();
+  aggregator->processWatermark(5999);
+
+  ASSERT_EQ(capturePtr->records().size(), 1);
+  auto partials = capturePtr->records()[0];
+  ASSERT_EQ(partials->size(), 1);
+  ASSERT_EQ(partials->childrenSize(), 2); // no key column
+  EXPECT_EQ(partials->childAt(0)->asFlatVector<int64_t>()->valueAt(0), 22);
+  EXPECT_EQ(partials->childAt(1)->asFlatVector<int64_t>()->valueAt(0), 5000);
+
+  aggregator->close();
+}
+
+// L4 keyless GLOBAL: the declared input carries "$keyless_key"
+// appended AFTER windowEnd ([intermediates, windowEnd, $keyless_key]);
+// the kFinal branch must read the intermediates at [0, numAggs) (the
+// windowEnd is one column left of the wrapped keyless tail) and emit
+// the Flink keyless global layout [aggs, w_start, w_end].
+TEST_F(WindowAggregatorTest, testGlobalKeylessConsumesPartials) {
+  auto capture = std::make_unique<CaptureTarget>(driverCtx_.get(), nextNodeId());
+  auto* capturePtr = capture.get();
+  const auto partialType = ROW(
+      {"a0", "a1", "window_end", "$keyless_key"},
+      {BIGINT(), BIGINT(), BIGINT(), BIGINT()});
+  auto aggregator = makeAggregator(
+      makeGlobalKeylessNode(
+          partialType,
+          // The Flink keyless global layout [aggs, w_start, w_end].
+          ROW({"s", "c", "w_start", "w_end"},
+              {BIGINT(), BIGINT(), TIMESTAMP(), TIMESTAMP()}),
+          5000,
+          0,
+          1,
+          /*rowtimeIndex=*/2,
+          /*windowStartIndex=*/2,
+          /*windowEndIndex=*/3,
+          /*keylessChannel=*/3),
+      std::move(capture));
+
+  // Narrow [a0, a1, windowEnd] partials - no keyless column at runtime.
+  aggregator->addInput(keylessPartialRecord2({10, 15}, {1, 1}, {5000, 5000}));
+  aggregator->advance();
+  aggregator->addInput(keylessPartialRecord2({30}, {1}, {10000}));
+  aggregator->advance();
+  aggregator->processWatermark(10999);
+
+  ASSERT_EQ(capturePtr->records().size(), 2);
+  for (const auto& out : capturePtr->records()) {
+    const auto sum = out->childAt(0)->asFlatVector<int64_t>()->valueAt(0);
+    const auto cnt = out->childAt(1)->asFlatVector<int64_t>()->valueAt(0);
+    const auto start =
+        out->childAt(2)->asFlatVector<Timestamp>()->valueAt(0).toMillis();
+    const auto end =
+        out->childAt(3)->asFlatVector<Timestamp>()->valueAt(0).toMillis();
+    ASSERT_EQ(out->childrenSize(), 4); // no key column
+    if (end == 5000) {
+      EXPECT_EQ(start, 0);
+      EXPECT_EQ(sum, 25);
+      EXPECT_EQ(cnt, 2);
+    } else {
+      EXPECT_EQ(end, 10000);
+      EXPECT_EQ(start, 5000);
+      EXPECT_EQ(sum, 30);
+      EXPECT_EQ(cnt, 1);
+    }
+  }
   aggregator->close();
 }
 
