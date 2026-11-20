@@ -884,6 +884,48 @@ TEST_F(WindowAggregatorTest, testHopMultiSliceMerge) {
 // H2 regression: a window whose data lives only in its FIRST slice still
 // fires through the chain (the old chain condition was dead code); a
 // fully empty window stops the chain.
+// Batched HOP fire merge (WindowAggregatorHopMerge): a wide window
+// (size 12s / slide 2s -> 5 merge units) folds all covered slices in
+// ONE extractAccumulators(N) + addSingleGroupIntermediateResults(N)
+// per aggregate; the observable result must equal the row-by-row
+// semantics (values are the same folds in the same ascending-sliceEnd
+// order).
+TEST_F(WindowAggregatorTest, testHopBatchedMergeWideWindow) {
+  auto capture =
+      std::make_unique<CaptureTarget>(driverCtx_.get(), nextNodeId());
+  auto* capturePtr = capture.get();
+  auto aggregator = makeAggregator(
+      makeNode({countStarOfC(), sumOfC()}, /*size=*/12000, /*step=*/2000, kHop),
+      std::move(capture));
+
+  // One row per covered slice of [0,12000): slices end at
+  // 2000..12000, prices 2..12 - the window sum folds all of them.
+  aggregator->addInput(windowRecord(
+      {1, 1, 1, 1, 1, 1},
+      {1000, 3000, 5000, 7000, 9000, 11000},
+      {2, 4, 6, 8, 10, 12}));
+  aggregator->advance();
+  // Earlier windows fire along the way; drive past the wide window.
+  for (int64_t wm = 2000; wm <= 14000; wm += 2000) {
+    aggregator->processWatermark(wm);
+  }
+
+  int64_t sawWide = false;
+  for (const auto& out : capturePtr->records()) {
+    const auto start =
+        out->childAt(1)->asFlatVector<Timestamp>()->valueAt(0).toMillis();
+    const auto end =
+        out->childAt(2)->asFlatVector<Timestamp>()->valueAt(0).toMillis();
+    if (start == 0 && end == 12000) {
+      sawWide = true;
+      EXPECT_EQ(out->childAt(3)->asFlatVector<int64_t>()->valueAt(0), 6);
+      EXPECT_EQ(out->childAt(4)->asFlatVector<int64_t>()->valueAt(0), 42);
+    }
+  }
+  EXPECT_TRUE(sawWide) << "the [0,12000) window must fire";
+  aggregator->close();
+}
+
 TEST_F(WindowAggregatorTest, testHopChainContinuationFromFirstSliceOnly) {
   auto capture =
       std::make_unique<CaptureTarget>(driverCtx_.get(), nextNodeId());

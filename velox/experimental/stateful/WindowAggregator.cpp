@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 #include "velox/experimental/stateful/WindowAggregator.h"
+#include "velox/experimental/stateful/WindowAggregatorHopMerge.h"
 
 #include <cstdlib>
 
@@ -548,13 +549,25 @@ void WindowAggregator::fireHopWindow(
     firstRow = state_->row(key, SliceEndNs(firstSliceEnd));
   }
 
-  // Merge the remaining covered slices into the first slice. Source
-  // slices are NOT removed: they are shared with later windows and are
-  // only cleared when they become a later window's first slice.
+  // Merge the remaining covered slices into the first slice in ONE
+  // batched fold (ascending sliceEnd, the same order the row-by-row
+  // merge consumed - see mergeAccumulatorRowsBatch). Source slices are
+  // NOT removed: they are shared with later windows and are only
+  // cleared when they become a later window's first slice.
+  hopMergeScratchRows_.clear();
   for (int64_t e = firstSliceEnd + sliceSize; e <= windowEnd; e += sliceSize) {
     if (char* sourceRow = state_->get(key, SliceEndNs(e))) {
-      mergeAccumulatorRows(firstRow, sourceRow);
+      hopMergeScratchRows_.push_back(sourceRow);
     }
+  }
+  if (!hopMergeScratchRows_.empty()) {
+    mergeAccumulatorRowsBatch(
+        firstRow,
+        hopMergeScratchRows_.data(),
+        hopMergeScratchRows_.size(),
+        aggregates_,
+        hopMergeScratchColumns_,
+        memoryPool());
   }
 
   // Empty-window suppression on the merged result (Flink checks the

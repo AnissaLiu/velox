@@ -156,14 +156,20 @@ class WindowAggregator : public StatefulOperator {
   /// the intermediate (extractAccumulators -> addSingleGroupIntermediate
   /// Results) path; the source row is left untouched. Reuses
   /// mergeScratchColumns_ across calls (see the .cpp for the reuse
-  /// safety argument).
+  /// safety argument). Used by the SESSION merge; the HOP fire path
+  /// uses the batched mergeAccumulatorRowsBatch instead.
   void mergeAccumulatorRows(char* targetRow, char* sourceRow);
 
 
   /// Lazily-built single-row intermediate columns backing
-  /// mergeAccumulatorRows on the hot merge paths (HOP fire heap-merge,
-  /// SESSION merge); one column per aggregate.
+  /// mergeAccumulatorRows (SESSION merge); one column per aggregate.
   std::vector<VectorPtr> mergeScratchColumns_;
+
+  /// Batched HOP fire merge scratch (see WindowAggregatorHopMerge.h):
+  /// per-aggregate intermediate columns sized to the widest window's
+  /// covered-slice count, and the source row pointer gather.
+  std::vector<VectorPtr> hopMergeScratchColumns_;
+  std::vector<const char*> hopMergeScratchRows_;
 
   /// Reused single-element argument vector for the per-aggregate merge
   /// call (see mergeRow).
